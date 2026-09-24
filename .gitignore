@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Java / Maven (server also has its own, this is a safety net)
+target/
+
+# Node / React client (coming later)
+node_modules/
+dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log

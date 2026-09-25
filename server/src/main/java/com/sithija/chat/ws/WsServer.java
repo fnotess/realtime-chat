@@ -53,6 +53,9 @@ public class WsServer {
     // while reassembling, which is what protects the server when there are thousands of connections.
     private static final int MAX_MESSAGE_BYTES = 64 * 1024;
 
+    // How long to wait for a client to finish closing after we reject it (see drainBeforeClose).
+    private static final int CLOSE_DRAIN_MS = 1_000;
+
     private final int port;
     // Shared builder so threads get sequential names (ws-conn-1, ws-conn-2...) in thread dumps.
     private final Thread.Builder connectionThreads = Thread.ofVirtual().name("ws-conn-", 1);
@@ -119,41 +122,84 @@ public class WsServer {
             // (Phase 4) rather than by read timeouts.
             socket.setSoTimeout(0);
 
+            // Nagle's algorithm holds back small writes (up to ~40ms with delayed ACKs) hoping to
+            // batch them. Chat frames are small and latency-sensitive, and each one already goes
+            // out in a single write.
+            socket.setTcpNoDelay(true);
+
+            var addr = socket.getRemoteSocketAddress();
             // Wraps the SAME buffered stream the handshake used (see above), so frame bytes
             // that arrived together with the handshake aren't skipped.
             WsFrameReader reader = new WsFrameReader(new DataInputStream(in), MAX_MESSAGE_BYTES);
-            WsFrame message;
-            while ((message = reader.readMessage()) != null) {
-                switch (message.opcode()) {
-                    case WsFrame.OP_TEXT -> log.info("Text from {}: {}", socket.getRemoteSocketAddress(),
-                            new String(message.payload(), StandardCharsets.UTF_8));
-                    case WsFrame.OP_BINARY -> log.info("Binary from {}: {} bytes",
-                            socket.getRemoteSocketAddress(), message.payload().length);
-                    case WsFrame.OP_CLOSE -> {
-                        // Phase 3 must echo a Close frame before closing; for now we just drop the socket.
-                        log.info("Close frame from {} (code {})", socket.getRemoteSocketAddress(),
-                                closeCode(message.payload()));
-                        return;
+            try (WsConnection conn = new WsConnection(socket)) {
+                try {
+                    WsFrame message;
+                    while ((message = reader.readMessage()) != null) {
+                        switch (message.opcode()) {
+                            // Echo for now; Phase 5 routes messages to their recipient instead.
+                            case WsFrame.OP_TEXT -> {
+                                String text = new String(message.payload(), StandardCharsets.UTF_8);
+                                log.debug("Text from {}: {}", addr, text);
+                                conn.sendText(text);
+                            }
+                            case WsFrame.OP_BINARY -> {
+                                log.debug("Binary from {}: {} bytes", addr, message.payload().length);
+                                conn.sendBinary(message.payload());
+                            }
+                            case WsFrame.OP_PING -> conn.sendPong(message.payload());
+                            // Section 5.5.3 allows unsolicited pongs as a one-way heartbeat, so
+                            // they're not an error. Phase 4 will use pongs for liveness.
+                            case WsFrame.OP_PONG -> { }
+                            case WsFrame.OP_CLOSE -> {
+                                byte[] payload = message.payload();
+                                conn.onCloseReceived(payload);
+                                if (WsConnection.isValidClosePayload(payload)) {
+                                    log.info("Close from {} (code {})", addr, WsConnection.closeCode(payload));
+                                } else {
+                                    log.info("Invalid Close payload from {} ({} bytes), replied 1002", addr, payload.length);
+                                }
+                                // Returning closes TCP here. Section 7.1.1: the server should close
+                                // first, so the TIME_WAIT state lands on the server, not the client.
+                                return;
+                            }
+                        }
                     }
-                    // Phase 3 answers pings with pongs; Phase 4 uses pongs for liveness.
-                    default -> log.debug("Control frame opcode {} from {}", message.opcode(),
-                            socket.getRemoteSocketAddress());
+                    log.info("Connection closed by {} without a Close frame", addr);
+                } catch (WsProtocolException e) {
+                    log.info("Protocol violation from {}: {} (close code {})", addr, e.getMessage(), e.closeCode());
+                    // Tell the client why; otherwise it only sees 1006 "abnormal closure".
+                    conn.sendClose(e.closeCode(), e.getMessage());
+                    drainBeforeClose(socket, in);
                 }
             }
-            log.info("Connection closed by {}", socket.getRemoteSocketAddress());
-        } catch (WsProtocolException e) {
-            // Phase 3 sends a Close frame with e.closeCode() first; for now just drop the socket.
-            log.info("Protocol violation from {}: {} (close code {})",
-                    socket.getRemoteSocketAddress(), e.getMessage(), e.closeCode());
         } catch (IOException e) {
             log.debug("Connection error: {}", e.getMessage());
         }
     }
 
-    // A close payload is optional; when present it starts with a 2-byte big-endian status code.
-    // 1005 is the RFC's "no status received" code, reserved for exactly this local reporting.
-    private static int closeCode(byte[] payload) {
-        return payload.length >= 2 ? ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF) : 1005;
+    /**
+     * Used after we send a Close because of a protocol error, when the rest of the client's
+     * bad message may still be unread. Closing a socket with unread input makes the OS send a
+     * TCP reset (RST) instead of a normal close (FIN). A reset can make the client discard our
+     * Close frame before reading it, so it only sees 1006.
+     * So we half-close (a FIN goes out after the Close frame), then read and discard until the
+     * client closes its side. The deadline stops a client that keeps sending from holding us.
+     */
+    private static void drainBeforeClose(Socket socket, InputStream in) {
+        try {
+            socket.shutdownOutput();
+            byte[] discard = new byte[8192];
+            long deadline = System.currentTimeMillis() + CLOSE_DRAIN_MS;
+            long remaining;
+            while ((remaining = deadline - System.currentTimeMillis()) > 0) {
+                socket.setSoTimeout((int) remaining);
+                if (in.read(discard) == -1) {
+                    return; // client closed its side: a clean close
+                }
+            }
+        } catch (IOException e) {
+            // Timeout or reset: we tried, and the socket is closed right after either way.
+        }
     }
 
     /** Returns true if the upgrade succeeded; otherwise writes an HTTP error and returns false. */

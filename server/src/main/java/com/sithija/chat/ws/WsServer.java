@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -47,6 +48,10 @@ public class WsServer {
     // A client that opens a TCP connection and never finishes the handshake
     // (slowloris-style) would otherwise hold a socket forever.
     private static final int HANDSHAKE_TIMEOUT_MS = 10_000;
+
+    // Chat messages are small. The cap bounds how much heap one client can make us hold
+    // while reassembling, which is what protects the server when there are thousands of connections.
+    private static final int MAX_MESSAGE_BYTES = 64 * 1024;
 
     private final int port;
     // Shared builder so threads get sequential names (ws-conn-1, ws-conn-2...) in thread dumps.
@@ -114,15 +119,41 @@ public class WsServer {
             // (Phase 4) rather than by read timeouts.
             socket.setSoTimeout(0);
 
-            // Phase 2 replaces this with the frame read loop. For now just drain bytes
-            // until the client disconnects, so we can see the connection open and close.
-            while (in.read() != -1) {
-                // discard
+            // Wraps the SAME buffered stream the handshake used (see above), so frame bytes
+            // that arrived together with the handshake aren't skipped.
+            WsFrameReader reader = new WsFrameReader(new DataInputStream(in), MAX_MESSAGE_BYTES);
+            WsFrame message;
+            while ((message = reader.readMessage()) != null) {
+                switch (message.opcode()) {
+                    case WsFrame.OP_TEXT -> log.info("Text from {}: {}", socket.getRemoteSocketAddress(),
+                            new String(message.payload(), StandardCharsets.UTF_8));
+                    case WsFrame.OP_BINARY -> log.info("Binary from {}: {} bytes",
+                            socket.getRemoteSocketAddress(), message.payload().length);
+                    case WsFrame.OP_CLOSE -> {
+                        // Phase 3 must echo a Close frame before closing; for now we just drop the socket.
+                        log.info("Close frame from {} (code {})", socket.getRemoteSocketAddress(),
+                                closeCode(message.payload()));
+                        return;
+                    }
+                    // Phase 3 answers pings with pongs; Phase 4 uses pongs for liveness.
+                    default -> log.debug("Control frame opcode {} from {}", message.opcode(),
+                            socket.getRemoteSocketAddress());
+                }
             }
             log.info("Connection closed by {}", socket.getRemoteSocketAddress());
+        } catch (WsProtocolException e) {
+            // Phase 3 sends a Close frame with e.closeCode() first; for now just drop the socket.
+            log.info("Protocol violation from {}: {} (close code {})",
+                    socket.getRemoteSocketAddress(), e.getMessage(), e.closeCode());
         } catch (IOException e) {
             log.debug("Connection error: {}", e.getMessage());
         }
+    }
+
+    // A close payload is optional; when present it starts with a 2-byte big-endian status code.
+    // 1005 is the RFC's "no status received" code, reserved for exactly this local reporting.
+    private static int closeCode(byte[] payload) {
+        return payload.length >= 2 ? ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF) : 1005;
     }
 
     /** Returns true if the upgrade succeeded; otherwise writes an HTTP error and returns false. */

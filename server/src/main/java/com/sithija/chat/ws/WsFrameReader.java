@@ -150,18 +150,25 @@ public class WsFrameReader {
     // Validated on the complete message, not per fragment: a multi-byte character may
     // legally be split across two fragments, and neither half is valid UTF-8 on its own.
     private static WsFrame validated(WsFrame message) throws WsProtocolException {
-        if (message.opcode() == WsFrame.OP_TEXT) {
-            try {
-                // new String(bytes, UTF_8) would silently replace bad bytes with U+FFFD;
-                // a decoder set to REPORT throws instead, which is what the RFC requires.
-                StandardCharsets.UTF_8.newDecoder()
-                        .onMalformedInput(CodingErrorAction.REPORT)
-                        .onUnmappableCharacter(CodingErrorAction.REPORT)
-                        .decode(ByteBuffer.wrap(message.payload()));
-            } catch (CharacterCodingException e) {
-                throw new WsProtocolException(INVALID_PAYLOAD, "Text message is not valid UTF-8");
-            }
+        byte[] payload = message.payload();
+        if (message.opcode() == WsFrame.OP_TEXT && !isValidUtf8(payload, 0, payload.length)) {
+            throw new WsProtocolException(INVALID_PAYLOAD, "Text message is not valid UTF-8");
         }
         return message;
+    }
+
+    // Shared with WsConnection, which must also validate the reason in a client's Close frame.
+    static boolean isValidUtf8(byte[] bytes, int offset, int length) {
+        try {
+            // new String(bytes, UTF_8) would silently replace bad bytes with U+FFFD;
+            // a decoder set to REPORT throws instead, which is what the RFC requires.
+            StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes, offset, length));
+            return true;
+        } catch (CharacterCodingException e) {
+            return false;
+        }
     }
 }

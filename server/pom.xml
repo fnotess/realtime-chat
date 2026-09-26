@@ -46,6 +46,13 @@
 			<groupId>org.flywaydb</groupId>
 			<artifactId>flyway-database-postgresql</artifactId>
 		</dependency>
+		<!-- JSON for the chat protocol over WebSocket text frames. Declared explicitly because
+		     the WebSocket code uses it directly; until now it only arrived through Flyway.
+		     Version managed by the Spring Boot parent. -->
+		<dependency>
+			<groupId>tools.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+		</dependency>
 
 		<dependency>
 			<groupId>org.postgresql</groupId>

@@ -20,5 +20,6 @@ public record WsProperties(
         @DefaultValue("10s") Duration writeTimeout,
         @DefaultValue("10s") Duration sweepInterval,
         @DefaultValue("2s") Duration shutdownGrace,
-        @DefaultValue("20") int maxConnectionsPerIp) {
+        @DefaultValue("20") int maxConnectionsPerIp,
+        @DefaultValue("256") int sendQueueCapacity) {
 }

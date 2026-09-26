@@ -30,9 +30,19 @@ public class WsFrameReader {
     private ByteArrayOutputStream fragments;
     private int fragmentOpcode;
 
+    // Runs after every complete frame, including each fragment and control frame, which
+    // readMessage() otherwise hides. The heartbeat uses it: a client busy sending a long
+    // fragmented message is alive even though no complete message has arrived yet.
+    private final Runnable onFrame;
+
     public WsFrameReader(DataInputStream in, int maxMessageBytes) {
+        this(in, maxMessageBytes, () -> { });
+    }
+
+    public WsFrameReader(DataInputStream in, int maxMessageBytes, Runnable onFrame) {
         this.in = in;
         this.maxMessageBytes = maxMessageBytes;
+        this.onFrame = onFrame;
     }
 
     /**
@@ -46,6 +56,7 @@ public class WsFrameReader {
             if (frame == null) {
                 return null;
             }
+            onFrame.run();
             int opcode = frame.opcode();
 
             if (WsFrame.isControl(opcode)) {

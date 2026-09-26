@@ -1,6 +1,8 @@
 package com.sithija.chat.ws;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -9,8 +11,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 
 /**
- * Handles the JSON chat protocol carried in text frames, and fans messages out through the
- * registry.
+ * Handles the JSON chat protocol carried in text frames: store first, then ack, then fan out.
  *
  * Invalid input gets an {"type":"error"} reply and the connection stays open. A typo in one
  * message is a client bug, not a protocol violation, and dropping the socket would take every
@@ -18,26 +19,34 @@ import java.util.regex.Pattern;
  */
 public class MessageRouter {
 
+    private static final Logger log = LoggerFactory.getLogger(MessageRouter.class);
+
     static final int MAX_TEXT_CHARS = 4000;
-    // Bounded because we echo it back in the ack; an unbounded id would let a client make
-    // us reflect arbitrary amounts of data.
+    // Error replies echo clientMsgId even when it isn't a valid UUID, so cap what we reflect:
+    // otherwise a client could make us send back arbitrarily large strings.
     private static final int MAX_CLIENT_MSG_ID_CHARS = 64;
     private static final Pattern USER_ID = Pattern.compile("[A-Za-z0-9_-]{1,32}");
+    // Canonical form only. UUID.fromString alone is lenient and accepts things like "1-1-1-1-1".
+    private static final Pattern UUID_FORMAT =
+            Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 
     private final ConnectionRegistry registry;
+    private final MessageStore store;
     private final JsonMapper json = JsonMapper.builder().build();
 
-    public MessageRouter(ConnectionRegistry registry) {
+    public MessageRouter(ConnectionRegistry registry, MessageStore store) {
         this.registry = registry;
+        this.store = store;
     }
 
     static boolean isValidUserId(String userId) {
         return userId != null && USER_ID.matcher(userId).matches();
     }
 
-    record Ack(String type, String clientMsgId, String id, long ts) { }
+    record Ack(String type, String clientMsgId, long id, long conversationId, long seq, long ts) { }
 
-    record Message(String type, String id, String from, String to, String text, String clientMsgId, long ts) { }
+    record Message(String type, long id, long conversationId, long seq, String from, String to,
+                   String text, String clientMsgId, long ts) { }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record ErrorReply(String type, String code, String message, String clientMsgId) { }
@@ -68,17 +77,37 @@ public class MessageRouter {
             return;
         }
 
-        // Temporary server id. Phase 6 replaces it with the stored row's id and a per-conversation
-        // sequence number, and saves the message before acking ("never ack what isn't stored").
-        // Until then, a message to an offline user is acked but lost.
-        String id = UUID.randomUUID().toString();
-        // Wall-clock time is right here, unlike the heartbeat: this is a timestamp people read,
-        // not an interval we measure.
-        long ts = System.currentTimeMillis();
+        // Runs on this connection's reader thread, so a tab's messages are stored one at a time,
+        // in the order it sent them. Blocking on the database is fine on a virtual thread.
+        MessageStore.StoredMessage stored;
+        try {
+            stored = store.save(senderId, to, UUID.fromString(clientMsgId), text);
+        } catch (MessageStore.UnknownRecipientException e) {
+            reply(sender, error("unknown_recipient", "No user named '" + to + "'", clientMsgId));
+            return;
+        } catch (RuntimeException e) {
+            // Nothing was stored, so no ack. The client can retry with the same clientMsgId;
+            // the unique constraint makes that retry safe even if the first attempt actually
+            // committed and only the reply was lost.
+            log.warn("Failed to store message from {}", senderId, e);
+            reply(sender, error("server_error", "Message not stored; retry with the same clientMsgId", clientMsgId));
+            return;
+        }
 
+        // Committed, so it's now safe to tell anyone. Fanning out before the commit could deliver
+        // a message that then rolls back, and the recipient would see a message that doesn't exist.
+        long ts = stored.createdAt().toEpochMilli();
+        reply(sender, new Ack("ack", clientMsgId, stored.id(), stored.conversationId(), stored.seq(), ts));
+
+        // A duplicate was already fanned out the first time. Tabs that missed it catch up from
+        // history, and clients dedupe by id either way.
+        if (stored.duplicate()) {
+            return;
+        }
         // Encoded once and shared by every recipient connection: fan-out to N tabs is N
         // queue offers, not N serializations.
-        byte[] message = encode(new Message("message", id, senderId, to, text, clientMsgId, ts));
+        byte[] message = encode(new Message("message", stored.id(), stored.conversationId(), stored.seq(),
+                senderId, to, text, clientMsgId, ts));
         for (WsConnection conn : registry.connectionsOf(to)) {
             conn.enqueueText(message);
         }
@@ -89,7 +118,6 @@ public class MessageRouter {
                 conn.enqueueText(message);
             }
         }
-        reply(sender, new Ack("ack", clientMsgId, id, ts));
     }
 
     void onBinary(WsConnection sender) {
@@ -106,7 +134,7 @@ public class MessageRouter {
         if (to.equals(senderId)) {
             return "self_send";
         }
-        if (clientMsgId.isEmpty() || clientMsgId.length() > MAX_CLIENT_MSG_ID_CHARS) {
+        if (!UUID_FORMAT.matcher(clientMsgId).matches()) {
             return "invalid_client_msg_id";
         }
         if (text.isBlank()) {
@@ -123,7 +151,7 @@ public class MessageRouter {
             case "missing_field" -> "'to', 'clientMsgId' and 'text' must all be strings";
             case "invalid_recipient" -> "'to' is not a valid user id";
             case "self_send" -> "Cannot send a message to yourself";
-            case "invalid_client_msg_id" -> "'clientMsgId' must be 1-" + MAX_CLIENT_MSG_ID_CHARS + " characters";
+            case "invalid_client_msg_id" -> "'clientMsgId' must be a UUID";
             case "empty_text" -> "'text' is empty";
             case "text_too_long" -> "'text' exceeds " + MAX_TEXT_CHARS + " characters";
             default -> code;

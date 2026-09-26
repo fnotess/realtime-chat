@@ -16,8 +16,8 @@ import org.springframework.context.annotation.Configuration;
 public class WsConfig {
 
     @Bean(initMethod = "start", destroyMethod = "stop")
-    public WsServer wsServer(WsProperties properties) {
+    public WsServer wsServer(WsProperties properties, MessageStore store) {
         // The clock is injected so tests can move time forward instead of sleeping.
-        return new WsServer(properties, System::nanoTime);
+        return new WsServer(properties, System::nanoTime, store);
     }
 }

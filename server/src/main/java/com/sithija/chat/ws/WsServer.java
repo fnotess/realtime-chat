@@ -74,7 +74,8 @@ public class WsServer {
     // Iteration is weakly consistent, so it never throws ConcurrentModificationException.
     private final Set<WsConnection> connections = ConcurrentHashMap.newKeySet();
     private final ConnectionRegistry registry = new ConnectionRegistry();
-    private final MessageRouter router = new MessageRouter(registry);
+    private final MessageStore store;
+    private final MessageRouter router;
     // Open (or handshaking) connections per remote IP, for the reconnect-storm limit.
     private final ConcurrentHashMap<InetAddress, Integer> connectionsPerIp = new ConcurrentHashMap<>();
 
@@ -83,9 +84,11 @@ public class WsServer {
     // volatile: written by Spring's shutdown thread, read by the accept-loop thread.
     private volatile boolean running;
 
-    public WsServer(WsProperties props, LongSupplier clock) {
+    public WsServer(WsProperties props, LongSupplier clock, MessageStore store) {
         this.props = props;
         this.clock = clock;
+        this.store = store;
+        this.router = new MessageRouter(registry, store);
     }
 
     public void start() throws IOException {
@@ -289,7 +292,9 @@ public class WsServer {
                         switch (message.opcode()) {
                             case WsFrame.OP_TEXT -> {
                                 String text = new String(message.payload(), StandardCharsets.UTF_8);
-                                log.debug("Text from {}: {}", conn, text);
+                                // Size only, never the text: message content is private and must not
+                                // end up in log files, whatever the log level.
+                                log.debug("Text frame from {} ({} bytes)", conn, message.payload().length);
                                 router.onText(conn, userId, text);
                             }
                             case WsFrame.OP_BINARY -> router.onBinary(conn);
@@ -396,6 +401,16 @@ public class WsServer {
         String userId = queryParam(requestLine, "user");
         if (!MessageRouter.isValidUserId(userId)) {
             writeHttpError(out, "400 Bad Request");
+            return null;
+        }
+
+        // DEV ONLY: auto-creates the user, since there's no sign-up yet. Done before the 101, so a
+        // database outage is a clean 503 rather than a socket that can't store anything.
+        try {
+            store.ensureUser(userId);
+        } catch (RuntimeException e) {
+            log.warn("Could not create user {}", userId, e);
+            writeHttpError(out, "503 Service Unavailable");
             return null;
         }
 

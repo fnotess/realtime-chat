@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -31,7 +32,7 @@ class WsConnectionTest {
 
     private final AtomicLong now = new AtomicLong();
     private final ByteArrayOutputStream wire = new ByteArrayOutputStream();
-    private final WsConnection conn = new WsConnection(wire, () -> { }, now::get, "test");
+    private final WsConnection conn = new WsConnection(wire, () -> { }, now::get, "test", 16);
 
     @Test
     void usesShortestLengthFormAtEachBoundary() throws IOException {
@@ -110,9 +111,9 @@ class WsConnectionTest {
     @Test
     void stuckWriteIsDetectedAndClosingReleasesTheLock() throws Exception {
         WsProperties props = new WsProperties(0, Duration.ofSeconds(30), Duration.ofSeconds(10),
-                Duration.ofSeconds(10), Duration.ofSeconds(10), Duration.ofSeconds(2), 20);
+                Duration.ofSeconds(10), Duration.ofSeconds(10), Duration.ofSeconds(2), 20, 16);
         BlockingOutputStream socketOut = new BlockingOutputStream();
-        WsConnection stuck = new WsConnection(socketOut, socketOut::close, now::get, "stuck");
+        WsConnection stuck = new WsConnection(socketOut, socketOut::close, now::get, "stuck", 16);
 
         // A client that stopped reading: this write blocks until the "socket" is closed.
         ExecutorService pool = Executors.newSingleThreadExecutor();
@@ -138,12 +139,35 @@ class WsConnectionTest {
         pool.shutdown();
     }
 
+    @Test
+    void fullQueueClosesSlowConsumerWithoutBlockingTheSender() throws Exception {
+        BlockingOutputStream socketOut = new BlockingOutputStream();
+        WsConnection slow = new WsConnection(socketOut, socketOut::close, now::get, "slow", 2);
+        slow.startWriter();
+        byte[] msg = "{}".getBytes(StandardCharsets.UTF_8);
+
+        // The writer takes the first frame and blocks writing it: a client that stopped reading.
+        assertTrue(slow.enqueueText(msg));
+        assertTrue(socketOut.writeEntered.await(2, TimeUnit.SECONDS));
+        assertTrue(slow.enqueueText(msg));
+        assertTrue(slow.enqueueText(msg)); // queue now full (2 of 2)
+
+        // The sender (fan-out) must get an immediate "no", not wait for the slow client.
+        boolean accepted = assertTimeoutPreemptively(Duration.ofMillis(500), () -> slow.enqueueText(msg));
+        assertFalse(accepted);
+
+        // The close happens on a separate thread. The writer holds the lock, so no Close frame
+        // is attempted and the "socket" is closed directly, which also fails the stuck write.
+        assertTrue(socketOut.closed.await(2, TimeUnit.SECONDS));
+        assertFalse(slow.enqueueText(msg), "dropped once closed");
+    }
+
     // --- helpers ---
 
     /** Stands in for a socket whose peer stopped reading: write() blocks until close(). */
     private static final class BlockingOutputStream extends OutputStream {
         final CountDownLatch writeEntered = new CountDownLatch(1);
-        private final CountDownLatch closed = new CountDownLatch(1);
+        final CountDownLatch closed = new CountDownLatch(1);
 
         @Override
         public void write(int b) throws IOException {
@@ -185,7 +209,7 @@ class WsConnectionTest {
 
     private static void assertCloseReply(byte[] clientPayload, byte[] expectedReply) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        new WsConnection(out, () -> { }, System::nanoTime, "test").onCloseReceived(clientPayload);
+        new WsConnection(out, () -> { }, System::nanoTime, "test", 16).onCloseReceived(clientPayload);
         assertArrayEquals(expectedReply, out.toByteArray());
     }
 

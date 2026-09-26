@@ -2,6 +2,8 @@ package com.sithija.chat.ws;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -101,9 +103,9 @@ class WsServerTest {
         advance(PONG_TIMEOUT);
         server.sweep();
 
-        // Still open and still serving: an echo comes back.
-        c.send(0x81, utf8("alive"));
-        assertArrayEquals(concat(bytes(0x81, 5), utf8("alive")), c.readBytes(7));
+        // Still open and still serving: an invalid message gets an error reply.
+        c.sendText("{}");
+        assertEquals("error", c.readJson().get("type").stringValue());
         assertEquals(1, server.connectionCount());
     }
 
@@ -147,13 +149,97 @@ class WsServerTest {
         });
     }
 
+    @Test
+    void handshakeWithoutValidUserIsRejected() throws Exception {
+        start(20);
+        assertEquals("HTTP/1.1 400 Bad Request", handshake(null).statusLine);
+        assertEquals("HTTP/1.1 400 Bad Request", handshake("not%20valid").statusLine);
+    }
+
+    @Test
+    void routesMessageBetweenTwoUsers() throws Exception {
+        start(20);
+        Client alice = connect("alice");
+        Client bob = connect("bob");
+
+        alice.sendText(sendJson("bob", "c1", "hi bob"));
+
+        JsonNode ack = alice.readJson();
+        assertEquals("ack", ack.get("type").stringValue());
+        assertEquals("c1", ack.get("clientMsgId").stringValue());
+        JsonNode msg = bob.readJson();
+        assertEquals("message", msg.get("type").stringValue());
+        assertEquals("alice", msg.get("from").stringValue());
+        assertEquals("bob", msg.get("to").stringValue());
+        assertEquals("hi bob", msg.get("text").stringValue());
+        assertEquals("c1", msg.get("clientMsgId").stringValue());
+        // The ack and the delivered message describe the same server-side message.
+        assertEquals(ack.get("id"), msg.get("id"));
+        assertEquals(ack.get("ts"), msg.get("ts"));
+    }
+
+    @Test
+    void deliversToEveryRecipientTabAndSendersOtherTabs() throws Exception {
+        start(20);
+        Client alice1 = connect("alice");
+        Client alice2 = connect("alice");
+        Client bob1 = connect("bob");
+        Client bob2 = connect("bob");
+
+        alice1.sendText(sendJson("bob", "c1", "hello"));
+
+        // Fan-out is queued before the ack, so if alice1 had wrongly been sent a copy it would
+        // arrive before the ack. Getting the ack first shows the originating tab got no copy.
+        assertEquals("ack", alice1.readJson().get("type").stringValue());
+        for (Client c : List.of(bob1, bob2, alice2)) {
+            JsonNode m = c.readJson();
+            assertEquals("message", m.get("type").stringValue());
+            assertEquals("alice", m.get("from").stringValue());
+            assertEquals("hello", m.get("text").stringValue());
+        }
+    }
+
+    @Test
+    void invalidMessagesGetAnErrorAndTheConnectionStaysOpen() throws Exception {
+        start(20);
+        Client alice = connect("alice");
+        connect("bob");
+        String[][] cases = {
+                {"not json", "invalid_json"},
+                {"[1, 2]", "invalid_json"},
+                {"{\"type\":\"dance\"}", "unknown_type"},
+                {"{\"type\":\"send\",\"to\":\"bob\",\"clientMsgId\":\"c1\"}", "missing_field"},
+                {"{\"type\":\"send\",\"to\":5,\"clientMsgId\":\"c1\",\"text\":\"hi\"}", "missing_field"},
+                {sendJson("bob", "c1", "   "), "empty_text"},
+                {sendJson("bob", "c1", "x".repeat(MessageRouter.MAX_TEXT_CHARS + 1)), "text_too_long"},
+                {sendJson("alice", "c1", "hi"), "self_send"},
+        };
+        for (String[] c : cases) {
+            alice.sendText(c[0]);
+            JsonNode reply = alice.readJson();
+            assertEquals("error", reply.get("type").stringValue(), c[0]);
+            assertEquals(c[1], reply.get("code").stringValue(), c[0]);
+        }
+
+        // Still connected, and a valid message still goes through.
+        alice.sendText(sendJson("bob", "c2", "ok"));
+        assertEquals("ack", alice.readJson().get("type").stringValue());
+    }
+
     // --- helpers ---
+
+    private static final JsonMapper JSON = JsonMapper.builder().build();
+
+    private static String sendJson(String to, String clientMsgId, String text) {
+        return "{\"type\":\"send\",\"to\":\"" + to + "\",\"clientMsgId\":\"" + clientMsgId
+                + "\",\"text\":\"" + text + "\"}";
+    }
 
     private void start(int maxPerIp) throws IOException {
         // Port 0 = any free port. The sweep interval is huge so the real sweeper thread never
         // fires during a test; the tests call sweep() themselves.
         WsProperties props = new WsProperties(0, PING_AFTER_IDLE, PONG_TIMEOUT, Duration.ofSeconds(10),
-                Duration.ofHours(1), Duration.ofMillis(300), maxPerIp);
+                Duration.ofHours(1), Duration.ofMillis(300), maxPerIp, 256);
         server = new WsServer(props, now::get);
         server.start();
     }
@@ -162,10 +248,14 @@ class WsServerTest {
         now.addAndGet(d.toNanos());
     }
 
-    /** Handshakes and waits until the server has registered the connection. */
     private Client connect() throws Exception {
+        return connect("tester");
+    }
+
+    /** Handshakes as the given user and waits until the server has registered the connection. */
+    private Client connect(String user) throws Exception {
         int before = server.connectionCount();
-        Client c = handshake();
+        Client c = handshake(user);
         assertEquals("HTTP/1.1 101 Switching Protocols", c.statusLine);
         // The server adds the connection just after writing the 101, on its own thread.
         eventually(() -> server.connectionCount() == before + 1);
@@ -173,10 +263,15 @@ class WsServerTest {
     }
 
     private Client handshake() throws IOException {
+        return handshake("tester");
+    }
+
+    private Client handshake(String user) throws IOException {
         Socket s = new Socket("localhost", server.localPort());
         clients.add(s);
         s.setSoTimeout(2000); // a missing frame fails the test instead of hanging it
-        s.getOutputStream().write(("GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+        String path = user == null ? "/" : "/?user=" + user;
+        s.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
                 + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                 + "Sec-WebSocket-Version: 13\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
         return new Client(s);
@@ -211,12 +306,32 @@ class WsServerTest {
             return b;
         }
 
-        /** Sends a masked client frame (payload under 126 bytes). */
+        void sendText(String text) throws IOException {
+            send(0x81, utf8(text));
+        }
+
+        /** Reads one server text frame (7- or 16-bit length) and parses it as JSON. */
+        JsonNode readJson() throws IOException {
+            assertEquals(0x81, in.readUnsignedByte(), "expected a text frame");
+            int length = in.readUnsignedByte();
+            if (length == 126) {
+                length = in.readUnsignedShort();
+            }
+            return JSON.readTree(new String(readBytes(length), StandardCharsets.UTF_8));
+        }
+
+        /** Sends a masked client frame (7- or 16-bit length). */
         void send(int b0, byte[] payload) throws IOException {
             byte[] mask = bytes(1, 2, 3, 4);
             ByteArrayOutputStream f = new ByteArrayOutputStream();
             f.write(b0);
-            f.write(0x80 | payload.length);
+            if (payload.length < 126) {
+                f.write(0x80 | payload.length);
+            } else {
+                f.write(0x80 | 126);
+                f.write(payload.length >> 8);
+                f.write(payload.length & 0xFF);
+            }
             f.writeBytes(mask);
             for (int i = 0; i < payload.length; i++) {
                 f.write(payload[i] ^ mask[i % 4]);

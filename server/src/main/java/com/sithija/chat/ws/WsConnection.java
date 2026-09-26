@@ -1,21 +1,30 @@
 package com.sithija.chat.ws;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
 /**
  * Server side of one WebSocket connection: every outbound frame and the close handshake.
  *
- * Only this connection's own thread reads from the socket, but from Phase 5 any user's
- * thread may write to it during fan-out. That's why every write goes through sendFrame().
+ * Only this connection's own thread reads from the socket. Writes come from several threads:
+ * the writer thread draining the send queue, the reader (pongs, close replies), the sweeper's
+ * ping threads and shutdown. That's why every write goes through the locked sendFrame().
  */
 public class WsConnection implements Closeable {
+
+    private static final Logger log = LoggerFactory.getLogger(WsConnection.class);
 
     enum State { OPEN, CLOSING, CLOSED }
 
@@ -48,12 +57,18 @@ public class WsConnection implements Closeable {
     // Changed under writeLock, except in close(); volatile so that change is visible too.
     private volatile State state = State.OPEN;
 
-    public WsConnection(Socket socket, LongSupplier clock) throws IOException {
-        this(socket.getOutputStream(), socket, clock, String.valueOf(socket.getRemoteSocketAddress()));
+    // Outbound text frames waiting for the writer thread. Bounded: this is the most memory
+    // one slow client can make us hold (capacity × message size) before we cut it off.
+    private final BlockingQueue<byte[]> sendQueue;
+    private final AtomicBoolean overflowed = new AtomicBoolean();
+    private volatile Thread writer;
+
+    public WsConnection(Socket socket, String label, LongSupplier clock, int sendQueueCapacity) throws IOException {
+        this(socket.getOutputStream(), socket, clock, label, sendQueueCapacity);
     }
 
     // Package-private so tests can capture the exact bytes and control the clock.
-    WsConnection(OutputStream out, Closeable transport, LongSupplier clock, String label) {
+    WsConnection(OutputStream out, Closeable transport, LongSupplier clock, String label, int sendQueueCapacity) {
         // Buffered so a small frame's header and payload leave in one write() (one TCP
         // segment) rather than a 2-byte packet followed by the payload.
         this.out = new BufferedOutputStream(out);
@@ -61,6 +76,67 @@ public class WsConnection implements Closeable {
         this.clock = clock;
         this.label = label;
         this.lastReceivedAt = clock.getAsLong();
+        this.sendQueue = new ArrayBlockingQueue<>(sendQueueCapacity);
+    }
+
+    /** Starts the thread that drains the send queue. Separate from the constructor so tests can skip it. */
+    void startWriter() {
+        writer = Thread.ofVirtual().name("ws-writer-" + label).start(() -> {
+            try {
+                while (state == State.OPEN) {
+                    sendFrame(WsFrame.OP_TEXT, sendQueue.take());
+                }
+            } catch (InterruptedException | IOException e) {
+                // close() interrupts us, or the socket failed: either way the connection is over.
+            }
+        });
+    }
+
+    /**
+     * Queues a text frame (already-encoded UTF-8 JSON) without ever blocking the caller.
+     * Fan-out calls this from the SENDER's thread, so one slow recipient must not slow the
+     * sender, or any other recipient. Returns false if the frame was dropped.
+     */
+    boolean enqueueText(byte[] utf8) {
+        if (state != State.OPEN) {
+            return false;
+        }
+        if (sendQueue.offer(utf8)) {
+            return true;
+        }
+        closeAsSlowConsumer();
+        return false;
+    }
+
+    // Queue full: the client isn't reading as fast as messages arrive. Waiting for it would
+    // stall fan-out, and a bigger queue would only delay the same outcome while using more
+    // memory. So we cut it off. It can reconnect and catch up (Phase 6 sync).
+    private void closeAsSlowConsumer() {
+        if (!overflowed.compareAndSet(false, true)) {
+            return; // already closing; later fan-outs just drop
+        }
+        log.info("Send queue full for {}, closing with 1008", this);
+        Thread.startVirtualThread(() -> {
+            try {
+                // tryLock: if the writer holds the lock it may be stuck mid-write, and the Close
+                // frame would queue behind it forever. Then just drop the socket.
+                if (writeLock.tryLock()) {
+                    try {
+                        sendClose(1008, "Too slow: send queue full");
+                    } finally {
+                        writeLock.unlock();
+                    }
+                }
+            } catch (IOException e) {
+                // Best-effort; closing below regardless.
+            } finally {
+                try {
+                    close();
+                } catch (IOException e) {
+                    // Nothing more to do.
+                }
+            }
+        });
     }
 
     /** Called by the reader for every inbound frame. Any frame proves the peer is alive, not just a pong. */
@@ -155,6 +231,11 @@ public class WsConnection implements Closeable {
     @Override
     public void close() throws IOException {
         state = State.CLOSED;
+        // Wakes the writer if it's parked in take(); queued frames are dropped with the connection.
+        Thread w = writer;
+        if (w != null) {
+            w.interrupt();
+        }
         transport.close();
     }
 
@@ -165,8 +246,8 @@ public class WsConnection implements Closeable {
      * Java socket writes have no timeout. If a client stops reading, its TCP buffers fill up
      * and write() blocks while holding writeLock, with every fan-out thread queued behind it.
      * writing/writeStartedAt let the sweeper spot this and close() the socket after
-     * writeTimeout, which fails the write and frees the lock. (Phase 5 may still want a bounded
-     * send queue, so senders aren't held up for the full writeTimeout.)
+     * writeTimeout, which fails the write and frees the lock. Chat messages never wait here on
+     * the sender's thread: they go through sendQueue, so only this connection's writer blocks.
      */
     private void sendFrame(int opcode, byte[] payload) throws IOException {
         writeLock.lock();

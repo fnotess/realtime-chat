@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.URLDecoder;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
@@ -72,6 +73,8 @@ public class WsServer {
     // Concurrent: added and removed by connection threads, iterated by the sweeper and stop().
     // Iteration is weakly consistent, so it never throws ConcurrentModificationException.
     private final Set<WsConnection> connections = ConcurrentHashMap.newKeySet();
+    private final ConnectionRegistry registry = new ConnectionRegistry();
+    private final MessageRouter router = new MessageRouter(registry);
     // Open (or handshaking) connections per remote IP, for the reconnect-storm limit.
     private final ConcurrentHashMap<InetAddress, Integer> connectionsPerIp = new ConcurrentHashMap<>();
 
@@ -251,10 +254,11 @@ public class WsServer {
             InputStream in = new BufferedInputStream(socket.getInputStream());
             OutputStream out = socket.getOutputStream();
 
-            if (!performHandshake(in, out, admitted)) {
+            String userId = performHandshake(in, out, admitted);
+            if (userId == null) {
                 return;
             }
-            log.info("Handshake OK from {}", socket.getRemoteSocketAddress());
+            log.info("Handshake OK from {} as {}", socket.getRemoteSocketAddress(), userId);
 
             // After the handshake the connection is long-lived and idle most of the time,
             // so the read timeout must go. The heartbeat sweeper detects dead peers instead.
@@ -268,10 +272,12 @@ public class WsServer {
             var addr = socket.getRemoteSocketAddress();
             // Wraps the SAME buffered stream the handshake used (see above), so frame bytes
             // that arrived together with the handshake aren't skipped.
-            WsConnection conn = new WsConnection(socket, clock);
+            WsConnection conn = new WsConnection(socket, userId + "@" + addr, clock, props.sendQueueCapacity());
             WsFrameReader reader = new WsFrameReader(new DataInputStream(in), MAX_MESSAGE_BYTES, conn::markReceived);
             connections.add(conn);
-            // The finally releases the slot even on exceptions, so the set can't leak.
+            registry.register(userId, conn);
+            conn.startWriter();
+            // The finally unregisters even on exceptions, so neither the set nor the registry leaks.
             try (conn) {
                 // Handshake finished after stop() already sent its 1001s: close instead of serving.
                 if (!running) {
@@ -281,16 +287,12 @@ public class WsServer {
                     WsFrame message;
                     while ((message = reader.readMessage()) != null) {
                         switch (message.opcode()) {
-                            // Echo for now; Phase 5 routes messages to their recipient instead.
                             case WsFrame.OP_TEXT -> {
                                 String text = new String(message.payload(), StandardCharsets.UTF_8);
-                                log.debug("Text from {}: {}", addr, text);
-                                conn.sendText(text);
+                                log.debug("Text from {}: {}", conn, text);
+                                router.onText(conn, userId, text);
                             }
-                            case WsFrame.OP_BINARY -> {
-                                log.debug("Binary from {}: {} bytes", addr, message.payload().length);
-                                conn.sendBinary(message.payload());
-                            }
+                            case WsFrame.OP_BINARY -> router.onBinary(conn);
                             case WsFrame.OP_PING -> conn.sendPong(message.payload());
                             // Any frame, a pong included, already updated lastReceivedAt through
                             // markReceived. Section 5.5.3 allows unsolicited pongs too.
@@ -317,6 +319,7 @@ public class WsServer {
                     drainBeforeClose(socket, in);
                 }
             } finally {
+                registry.unregister(userId, conn);
                 connections.remove(conn);
             }
         } catch (IOException e) {
@@ -353,19 +356,19 @@ public class WsServer {
         }
     }
 
-    /** Returns true if the upgrade succeeded; otherwise writes an HTTP error and returns false. */
-    private boolean performHandshake(InputStream in, OutputStream out, boolean admitted) throws IOException {
+    /** Returns the user id if the upgrade succeeded; otherwise writes an HTTP error and returns null. */
+    private String performHandshake(InputStream in, OutputStream out, boolean admitted) throws IOException {
         String requestLine = readLine(in);
         if (requestLine == null || !requestLine.startsWith("GET ")) {
             // RFC 6455 section 4.1: the opening handshake must be an HTTP GET.
             writeHttpError(out, "400 Bad Request");
-            return false;
+            return null;
         }
 
         Map<String, String> headers = readHeaders(in);
         if (headers == null) {
             writeHttpError(out, "400 Bad Request");
-            return false;
+            return null;
         }
 
         boolean isUpgrade = "websocket".equalsIgnoreCase(headers.get("upgrade"));
@@ -376,7 +379,7 @@ public class WsServer {
 
         if (!isUpgrade || !hasConnectionUpgrade || key == null) {
             writeHttpError(out, "400 Bad Request");
-            return false;
+            return null;
         }
         if (!"13".equals(headers.get("sec-websocket-version"))) {
             // RFC 6455 section 4.4: tell the client which version we do speak.
@@ -384,7 +387,16 @@ public class WsServer {
                     + "Sec-WebSocket-Version: 13\r\n"
                     + "Content-Length: 0\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
-            return false;
+            return null;
+        }
+
+        // DEV ONLY: identity comes straight from the URL (ws://host:8081/?user=alice), so anyone
+        // can claim to be anyone. Phase 7 replaces this with the session cookie the browser
+        // sends on the upgrade request.
+        String userId = queryParam(requestLine, "user");
+        if (!MessageRouter.isValidUserId(userId)) {
+            writeHttpError(out, "400 Bad Request");
+            return null;
         }
 
         // After reading the whole request, so the client gets a real HTTP response rather than
@@ -393,7 +405,7 @@ public class WsServer {
         // exhausting the server's file descriptors meanwhile.
         if (!admitted) {
             writeHttpError(out, "429 Too Many Requests");
-            return false;
+            return null;
         }
 
         // TODO (Phase 7): check the Origin header and the session cookie here, before
@@ -407,7 +419,23 @@ public class WsServer {
                 + "\r\n";
         out.write(response.getBytes(StandardCharsets.ISO_8859_1));
         out.flush();
-        return true;
+        return userId;
+    }
+
+    // "GET /?user=alice&x=1 HTTP/1.1" → "alice". Returns null if the parameter is absent.
+    private static String queryParam(String requestLine, String name) {
+        String[] parts = requestLine.split(" ");
+        int q = parts.length > 1 ? parts[1].indexOf('?') : -1;
+        if (q < 0) {
+            return null;
+        }
+        for (String pair : parts[1].substring(q + 1).split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0 && pair.substring(0, eq).equals(name)) {
+                return URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+            }
+        }
+        return null;
     }
 
     /** Accept key = base64(SHA-1(clientKey + GUID)), per RFC 6455 section 4.2.2. */

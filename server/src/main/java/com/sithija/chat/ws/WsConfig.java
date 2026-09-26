@@ -1,6 +1,6 @@
 package com.sithija.chat.ws;
 
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -12,10 +12,12 @@ import org.springframework.context.annotation.Configuration;
  * container stop (otherwise restarts can fail with "port already in use").
  */
 @Configuration
+@EnableConfigurationProperties(WsProperties.class)
 public class WsConfig {
 
     @Bean(initMethod = "start", destroyMethod = "stop")
-    public WsServer wsServer(@Value("${chat.ws.port:8081}") int port) {
-        return new WsServer(port);
+    public WsServer wsServer(WsProperties properties) {
+        // The clock is injected so tests can move time forward instead of sleeping.
+        return new WsServer(properties, System::nanoTime);
     }
 }

@@ -7,6 +7,7 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 
 /**
  * Server side of one WebSocket connection: every outbound frame and the close handshake.
@@ -18,8 +19,25 @@ public class WsConnection implements Closeable {
 
     enum State { OPEN, CLOSING, CLOSED }
 
+    /** What the heartbeat sweeper should do with this connection. */
+    enum Liveness { OK, PING, DEAD, STUCK_WRITE }
+
     private final OutputStream out;
     private final Closeable transport;
+    private final String label;
+
+    // Monotonic nanoseconds (System.nanoTime in production). Only differences between two
+    // readings mean anything: the origin is arbitrary, and a value can even be negative.
+    private final LongSupplier clock;
+
+    // Written by the reader thread (lastReceivedAt) and by writers (write*). Read by the sweeper
+    // without the lock, so all of these are volatile. Separate booleans instead of a "0 = unset"
+    // timestamp, because 0 is a perfectly valid nanoTime reading.
+    private volatile long lastReceivedAt;
+    private volatile long pingSentAt;
+    private volatile boolean pingOutstanding;
+    private volatile long writeStartedAt;
+    private volatile boolean writing;
 
     // ReentrantLock, not synchronized: on Java 21 a virtual thread that blocks (on the lock
     // or on a socket write) inside synchronized pins its carrier OS thread. One slow client
@@ -30,16 +48,63 @@ public class WsConnection implements Closeable {
     // Changed under writeLock, except in close(); volatile so that change is visible too.
     private volatile State state = State.OPEN;
 
-    public WsConnection(Socket socket) throws IOException {
-        this(socket.getOutputStream(), socket);
+    public WsConnection(Socket socket, LongSupplier clock) throws IOException {
+        this(socket.getOutputStream(), socket, clock, String.valueOf(socket.getRemoteSocketAddress()));
     }
 
-    // Package-private so tests can capture the exact bytes in a ByteArrayOutputStream.
-    WsConnection(OutputStream out, Closeable transport) {
+    // Package-private so tests can capture the exact bytes and control the clock.
+    WsConnection(OutputStream out, Closeable transport, LongSupplier clock, String label) {
         // Buffered so a small frame's header and payload leave in one write() (one TCP
         // segment) rather than a 2-byte packet followed by the payload.
         this.out = new BufferedOutputStream(out);
         this.transport = transport;
+        this.clock = clock;
+        this.label = label;
+        this.lastReceivedAt = clock.getAsLong();
+    }
+
+    /** Called by the reader for every inbound frame. Any frame proves the peer is alive, not just a pong. */
+    void markReceived() {
+        lastReceivedAt = clock.getAsLong();
+        pingOutstanding = false;
+    }
+
+    /**
+     * Decides this connection's fate for the sweeper. Never blocks and never does I/O: one
+     * stuck client must not be able to stall the heartbeat for every other connection.
+     */
+    Liveness checkLiveness(long now, WsProperties props) {
+        if (state == State.CLOSED) {
+            return Liveness.OK; // already closed; the reader thread is removing it
+        }
+        // Checked first: the sweeper's ping to this client would only queue behind the stuck write.
+        if (writing && now - writeStartedAt >= props.writeTimeout().toNanos()) {
+            return Liveness.STUCK_WRITE;
+        }
+        if (pingOutstanding) {
+            return now - pingSentAt >= props.pongTimeout().toNanos() ? Liveness.DEAD : Liveness.OK;
+        }
+        if (now - lastReceivedAt >= props.pingAfterIdle().toNanos()) {
+            // Marked now, not when the ping actually goes out, so the next sweep doesn't ping again
+            // while this ping is still waiting for the write lock.
+            pingSentAt = now;
+            pingOutstanding = true;
+            return Liveness.PING;
+        }
+        return Liveness.OK;
+    }
+
+    // Read-only views for the sweeper's log lines.
+    long lastReceivedAt() {
+        return lastReceivedAt;
+    }
+
+    long writeStartedAt() {
+        return writeStartedAt;
+    }
+
+    void sendPing() throws IOException {
+        sendFrame(WsFrame.OP_PING, new byte[0]);
     }
 
     public void sendText(String text) throws IOException {
@@ -97,10 +162,11 @@ public class WsConnection implements Closeable {
      * The only method that writes to the socket. Without the lock, two threads could write
      * header A, header B, payload A, payload B, and the client would parse garbage from then on.
      *
-     * Known gap (Phase 4/5 backpressure): the write has no timeout. If a client stops reading,
-     * its TCP buffers fill up, and write() blocks while holding writeLock. Every fan-out thread
-     * sending to that client would then queue behind it. Fix with a bounded per-connection
-     * send queue, or by calling close() after a write deadline.
+     * Java socket writes have no timeout. If a client stops reading, its TCP buffers fill up
+     * and write() blocks while holding writeLock, with every fan-out thread queued behind it.
+     * writing/writeStartedAt let the sweeper spot this and close() the socket after
+     * writeTimeout, which fails the write and frees the lock. (Phase 5 may still want a bounded
+     * send queue, so senders aren't held up for the full writeTimeout.)
      */
     private void sendFrame(int opcode, byte[] payload) throws IOException {
         writeLock.lock();
@@ -113,10 +179,15 @@ public class WsConnection implements Closeable {
             if (opcode == WsFrame.OP_CLOSE) {
                 state = State.CLOSING;
             }
+            // Started after taking the lock: only time spent actually blocked on the socket
+            // counts, not time waiting behind another writer.
+            writeStartedAt = clock.getAsLong();
+            writing = true;
             writeHeader(opcode, payload.length);
             out.write(payload);
             out.flush();
         } finally {
+            writing = false;
             writeLock.unlock();
         }
     }
@@ -187,6 +258,11 @@ public class WsConnection implements Closeable {
         payload[1] = (byte) code;
         System.arraycopy(reasonBytes, 0, payload, 2, reasonBytes.length);
         return payload;
+    }
+
+    @Override
+    public String toString() {
+        return label;
     }
 
     // Returns 1005 ("no status received") for an empty payload. That's the code the RFC

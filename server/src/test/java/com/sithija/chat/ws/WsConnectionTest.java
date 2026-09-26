@@ -6,24 +6,32 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class WsConnectionTest {
 
+    private final AtomicLong now = new AtomicLong();
     private final ByteArrayOutputStream wire = new ByteArrayOutputStream();
-    private final WsConnection conn = new WsConnection(wire, () -> { });
+    private final WsConnection conn = new WsConnection(wire, () -> { }, now::get, "test");
 
     @Test
     void usesShortestLengthFormAtEachBoundary() throws IOException {
@@ -99,7 +107,65 @@ class WsConnectionTest {
         assertEquals(threads * perThread, received.size());
     }
 
+    @Test
+    void stuckWriteIsDetectedAndClosingReleasesTheLock() throws Exception {
+        WsProperties props = new WsProperties(0, Duration.ofSeconds(30), Duration.ofSeconds(10),
+                Duration.ofSeconds(10), Duration.ofSeconds(10), Duration.ofSeconds(2), 20);
+        BlockingOutputStream socketOut = new BlockingOutputStream();
+        WsConnection stuck = new WsConnection(socketOut, socketOut::close, now::get, "stuck");
+
+        // A client that stopped reading: this write blocks until the "socket" is closed.
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> writer = pool.submit(() -> {
+            stuck.sendText("never delivered");
+            return null;
+        });
+        assertTrue(socketOut.writeEntered.await(2, TimeUnit.SECONDS));
+
+        now.addAndGet(Duration.ofSeconds(9).toNanos());
+        assertEquals(WsConnection.Liveness.OK, stuck.checkLiveness(now.get(), props));
+        now.addAndGet(Duration.ofSeconds(1).toNanos());
+        assertEquals(WsConnection.Liveness.STUCK_WRITE, stuck.checkLiveness(now.get(), props));
+
+        // What the sweeper does on STUCK_WRITE. The blocked write must fail, and the lock must
+        // be free: a later send fails at once with "closed" instead of hanging behind the lock.
+        stuck.close();
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            ExecutionException e = assertThrows(ExecutionException.class, writer::get);
+            assertTrue(e.getCause() instanceof IOException);
+            assertThrows(IOException.class, () -> stuck.sendText("after close"));
+        });
+        pool.shutdown();
+    }
+
     // --- helpers ---
+
+    /** Stands in for a socket whose peer stopped reading: write() blocks until close(). */
+    private static final class BlockingOutputStream extends OutputStream {
+        final CountDownLatch writeEntered = new CountDownLatch(1);
+        private final CountDownLatch closed = new CountDownLatch(1);
+
+        @Override
+        public void write(int b) throws IOException {
+            write(new byte[] {(byte) b}, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            writeEntered.countDown();
+            try {
+                closed.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IOException("Socket closed");
+        }
+
+        @Override
+        public void close() {
+            closed.countDown();
+        }
+    }
 
     // Lengths vary so that both the 7-bit and 16-bit forms are exercised concurrently.
     private static String message(int thread, int i) {
@@ -119,7 +185,7 @@ class WsConnectionTest {
 
     private static void assertCloseReply(byte[] clientPayload, byte[] expectedReply) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        new WsConnection(out, () -> { }).onCloseReceived(clientPayload);
+        new WsConnection(out, () -> { }, System::nanoTime, "test").onCloseReceived(clientPayload);
         assertArrayEquals(expectedReply, out.toByteArray());
     }
 

@@ -33,6 +33,9 @@ class WsServerTest {
 
     private static final Duration PING_AFTER_IDLE = Duration.ofSeconds(30);
     private static final Duration PONG_TIMEOUT = Duration.ofSeconds(10);
+    // clientMsgIds must be UUIDs.
+    private static final String C1 = "00000000-0000-4000-8000-000000000001";
+    private static final String C2 = "00000000-0000-4000-8000-000000000002";
 
     // Arbitrary and negative on purpose: nanoTime's origin is arbitrary, so the code must only
     // ever subtract timestamps, never compare them to 0 or to wall-clock time.
@@ -162,17 +165,17 @@ class WsServerTest {
         Client alice = connect("alice");
         Client bob = connect("bob");
 
-        alice.sendText(sendJson("bob", "c1", "hi bob"));
+        alice.sendText(sendJson("bob", C1, "hi bob"));
 
         JsonNode ack = alice.readJson();
         assertEquals("ack", ack.get("type").stringValue());
-        assertEquals("c1", ack.get("clientMsgId").stringValue());
+        assertEquals(C1, ack.get("clientMsgId").stringValue());
         JsonNode msg = bob.readJson();
         assertEquals("message", msg.get("type").stringValue());
         assertEquals("alice", msg.get("from").stringValue());
         assertEquals("bob", msg.get("to").stringValue());
         assertEquals("hi bob", msg.get("text").stringValue());
-        assertEquals("c1", msg.get("clientMsgId").stringValue());
+        assertEquals(C1, msg.get("clientMsgId").stringValue());
         // The ack and the delivered message describe the same server-side message.
         assertEquals(ack.get("id"), msg.get("id"));
         assertEquals(ack.get("ts"), msg.get("ts"));
@@ -186,17 +189,20 @@ class WsServerTest {
         Client bob1 = connect("bob");
         Client bob2 = connect("bob");
 
-        alice1.sendText(sendJson("bob", "c1", "hello"));
+        alice1.sendText(sendJson("bob", C1, "hello"));
 
-        // Fan-out is queued before the ack, so if alice1 had wrongly been sent a copy it would
-        // arrive before the ack. Getting the ack first shows the originating tab got no copy.
         assertEquals("ack", alice1.readJson().get("type").stringValue());
         for (Client c : List.of(bob1, bob2, alice2)) {
             JsonNode m = c.readJson();
             assertEquals("message", m.get("type").stringValue());
             assertEquals("alice", m.get("from").stringValue());
             assertEquals("hello", m.get("text").stringValue());
+            assertEquals(1, m.get("seq").asLong());
         }
+        // The originating tab gets no copy. Fan-out is queued before onText returns, so a stray
+        // copy would sit in alice1's queue ahead of the reply to this next (invalid) frame.
+        alice1.sendText("{}");
+        assertEquals("error", alice1.readJson().get("type").stringValue());
     }
 
     @Test
@@ -210,9 +216,11 @@ class WsServerTest {
                 {"{\"type\":\"dance\"}", "unknown_type"},
                 {"{\"type\":\"send\",\"to\":\"bob\",\"clientMsgId\":\"c1\"}", "missing_field"},
                 {"{\"type\":\"send\",\"to\":5,\"clientMsgId\":\"c1\",\"text\":\"hi\"}", "missing_field"},
-                {sendJson("bob", "c1", "   "), "empty_text"},
-                {sendJson("bob", "c1", "x".repeat(MessageRouter.MAX_TEXT_CHARS + 1)), "text_too_long"},
-                {sendJson("alice", "c1", "hi"), "self_send"},
+                {sendJson("bob", C1, "   "), "empty_text"},
+                {sendJson("bob", C1, "x".repeat(MessageRouter.MAX_TEXT_CHARS + 1)), "text_too_long"},
+                {sendJson("alice", C1, "hi"), "self_send"},
+                {sendJson("nobody", C1, "hi"), "unknown_recipient"},
+                {sendJson("bob", "not-a-uuid", "hi"), "invalid_client_msg_id"},
         };
         for (String[] c : cases) {
             alice.sendText(c[0]);
@@ -222,7 +230,7 @@ class WsServerTest {
         }
 
         // Still connected, and a valid message still goes through.
-        alice.sendText(sendJson("bob", "c2", "ok"));
+        alice.sendText(sendJson("bob", C2, "ok"));
         assertEquals("ack", alice.readJson().get("type").stringValue());
     }
 
@@ -240,7 +248,7 @@ class WsServerTest {
         // fires during a test; the tests call sweep() themselves.
         WsProperties props = new WsProperties(0, PING_AFTER_IDLE, PONG_TIMEOUT, Duration.ofSeconds(10),
                 Duration.ofHours(1), Duration.ofMillis(300), maxPerIp, 256);
-        server = new WsServer(props, now::get);
+        server = new WsServer(props, now::get, new InMemoryMessageStore());
         server.start();
     }
 

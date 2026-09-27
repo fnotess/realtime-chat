@@ -1,6 +1,6 @@
 package com.sithija.chat.ws;
 
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import com.sithija.chat.auth.AuthProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -12,12 +12,13 @@ import org.springframework.context.annotation.Configuration;
  * container stop (otherwise restarts can fail with "port already in use").
  */
 @Configuration
-@EnableConfigurationProperties(WsProperties.class)
 public class WsConfig {
 
     @Bean(initMethod = "start", destroyMethod = "stop")
-    public WsServer wsServer(WsProperties properties, MessageStore store) {
-        // The clock is injected so tests can move time forward instead of sleeping.
-        return new WsServer(properties, System::nanoTime, store);
+    public WsServer wsServer(WsProperties properties, MessageStore store, SessionAuthenticator sessions,
+                             AuthProperties auth) {
+        // The clock is injected so tests can move time forward instead of sleeping. The Origin
+        // allowlist is the same one the REST CSRF check uses, so the two can't drift apart.
+        return new WsServer(properties, System::nanoTime, store, sessions, auth.allowedOrigins());
     }
 }

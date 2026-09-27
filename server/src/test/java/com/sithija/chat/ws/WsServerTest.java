@@ -1,6 +1,7 @@
 package com.sithija.chat.ws;
 
 import org.junit.jupiter.api.AfterEach;
+import com.sithija.chat.ws.SessionAuthenticator.AuthenticatedSession;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -14,8 +15,13 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
@@ -40,7 +46,10 @@ class WsServerTest {
     // Arbitrary and negative on purpose: nanoTime's origin is arbitrary, so the code must only
     // ever subtract timestamps, never compare them to 0 or to wall-clock time.
     private final AtomicLong now = new AtomicLong(-5_000_000_000_000L);
+    private static final String ORIGIN = "http://localhost:8080";
     private final List<Socket> clients = new ArrayList<>();
+    private final InMemoryMessageStore store = new InMemoryMessageStore();
+    private final FakeSessions sessions = new FakeSessions();
     private WsServer server;
 
     @AfterEach
@@ -153,10 +162,97 @@ class WsServerTest {
     }
 
     @Test
-    void handshakeWithoutValidUserIsRejected() throws Exception {
+    void handshakeWithoutValidSessionGets401() throws Exception {
         start(20);
-        assertEquals("HTTP/1.1 400 Bad Request", handshake(null).statusLine);
-        assertEquals("HTTP/1.1 400 Bad Request", handshake("not%20valid").statusLine);
+        String token = sessions.login("alice", Duration.ofHours(1)).token;
+        assertEquals("HTTP/1.1 401 Unauthorized", handshake(null, ORIGIN).statusLine, "no Cookie header");
+        assertEquals("HTTP/1.1 401 Unauthorized", handshake("other=" + token, ORIGIN).statusLine, "wrong cookie name");
+        assertEquals("HTTP/1.1 401 Unauthorized", handshake("chat_session=forged", ORIGIN).statusLine, "unknown token");
+        // Found among other cookies, as browsers send them.
+        assertEquals("HTTP/1.1 101 Switching Protocols",
+                handshake("theme=dark; chat_session=" + token + "; x=1", ORIGIN).statusLine);
+    }
+
+    @Test
+    void handshakeFromOtherOriginGets403EvenWithValidCookie() throws Exception {
+        start(20);
+        String cookie = "chat_session=" + sessions.login("alice", Duration.ofHours(1)).token;
+        // The CSWSH case: evil.example's page opens a socket, and the browser attaches alice's cookie.
+        assertEquals("HTTP/1.1 403 Forbidden", handshake(cookie, "http://evil.example").statusLine);
+        // Same host, different port: same-site for cookies, but a different origin.
+        assertEquals("HTTP/1.1 403 Forbidden", handshake(cookie, "http://localhost:5173").statusLine);
+        assertEquals("HTTP/1.1 403 Forbidden", handshake(cookie, null).statusLine, "missing Origin");
+        assertEquals(0, server.connectionCount());
+    }
+
+    @Test
+    void perUserLimitReturns429ButOtherUsersCanConnect() throws Exception {
+        start(2, 20);
+        Client first = connect("alice");
+        connect("alice");
+
+        assertEquals("HTTP/1.1 429 Too Many Requests", handshakeAs("alice").statusLine);
+        connect("bob"); // same IP, different user: unaffected
+
+        first.send(0x88, bytes(0x03, 0xE8));
+        eventually(() -> {
+            try {
+                return handshakeAs("alice").statusLine.equals("HTTP/1.1 101 Switching Protocols");
+            } catch (IOException e) {
+                return false;
+            }
+        });
+    }
+
+    @Test
+    void sweeperClosesConnectionWhenSessionExpires() throws Exception {
+        start(20);
+        // Shorter than PING_AFTER_IDLE, so no heartbeat ping gets in the way; only expiry is under test.
+        Client c = connect(sessions.login("alice", Duration.ofSeconds(20)));
+
+        advance(Duration.ofSeconds(19));
+        server.sweep();
+        assertEquals(1, server.connectionCount());
+
+        advance(Duration.ofSeconds(1));
+        server.sweep();
+        assertEquals(WsServer.CLOSE_SESSION_ENDED, c.readCloseCode());
+        assertTrue(c.isClosedByServer());
+        eventually(() -> server.connectionCount() == 0);
+    }
+
+    @Test
+    void closeSessionClosesOnlyThatSessionsSockets() throws Exception {
+        start(20);
+        FakeSessions.Session laptop = sessions.login("alice", Duration.ofHours(1));
+        Client tab1 = connect(laptop);
+        Client tab2 = connect(laptop);
+        Client phone = connect(sessions.login("alice", Duration.ofHours(1)));
+        connect("bob");
+
+        server.closeSession(laptop.id);
+
+        for (Client c : List.of(tab1, tab2)) {
+            assertEquals(WsServer.CLOSE_SESSION_ENDED, c.readCloseCode());
+            assertTrue(c.isClosedByServer());
+        }
+        // Alice's other login is untouched and still delivers.
+        phone.sendText(sendJson("bob", C1, "still here"));
+        assertEquals("ack", phone.readJson().get("type").stringValue());
+    }
+
+    @Test
+    void sessionRevokedDuringHandshakeIsClosedRightAfterConnecting() throws Exception {
+        start(20);
+        // Simulates logout landing between the handshake's session check and the connection being
+        // registered: authenticate() still saw the session, but it's gone by the re-check.
+        FakeSessions.Session s = sessions.login("alice", Duration.ofHours(1));
+        sessions.revokedAfterAuth.add(s.id);
+
+        Client c = handshake("chat_session=" + s.token, ORIGIN);
+        assertEquals("HTTP/1.1 101 Switching Protocols", c.statusLine);
+        assertEquals(WsServer.CLOSE_SESSION_ENDED, c.readCloseCode());
+        assertTrue(c.isClosedByServer());
     }
 
     @Test
@@ -244,11 +340,15 @@ class WsServerTest {
     }
 
     private void start(int maxPerIp) throws IOException {
+        start(20, maxPerIp);
+    }
+
+    private void start(int maxPerUser, int maxPerIp) throws IOException {
         // Port 0 = any free port. The sweep interval is huge so the real sweeper thread never
         // fires during a test; the tests call sweep() themselves.
         WsProperties props = new WsProperties(0, PING_AFTER_IDLE, PONG_TIMEOUT, Duration.ofSeconds(10),
-                Duration.ofHours(1), Duration.ofMillis(300), maxPerIp, 256);
-        server = new WsServer(props, now::get, new InMemoryMessageStore());
+                Duration.ofHours(1), Duration.ofMillis(300), maxPerUser, maxPerIp, 256);
+        server = new WsServer(props, now::get, store, sessions, List.of(ORIGIN));
         server.start();
     }
 
@@ -260,10 +360,14 @@ class WsServerTest {
         return connect("tester");
     }
 
-    /** Handshakes as the given user and waits until the server has registered the connection. */
     private Client connect(String user) throws Exception {
+        return connect(sessions.login(user, Duration.ofDays(1)));
+    }
+
+    /** Handshakes with the session's cookie and waits until the server has registered the connection. */
+    private Client connect(FakeSessions.Session session) throws Exception {
         int before = server.connectionCount();
-        Client c = handshake(user);
+        Client c = handshake("chat_session=" + session.token, ORIGIN);
         assertEquals("HTTP/1.1 101 Switching Protocols", c.statusLine);
         // The server adds the connection just after writing the 101, on its own thread.
         eventually(() -> server.connectionCount() == before + 1);
@@ -271,18 +375,54 @@ class WsServerTest {
     }
 
     private Client handshake() throws IOException {
-        return handshake("tester");
+        return handshakeAs("tester");
     }
 
-    private Client handshake(String user) throws IOException {
+    private Client handshakeAs(String user) throws IOException {
+        return handshake("chat_session=" + sessions.login(user, Duration.ofDays(1)).token, ORIGIN);
+    }
+
+    /** A browser-like upgrade request. null leaves the header out. */
+    private Client handshake(String cookieHeader, String origin) throws IOException {
         Socket s = new Socket("localhost", server.localPort());
         clients.add(s);
         s.setSoTimeout(2000); // a missing frame fails the test instead of hanging it
-        String path = user == null ? "/" : "/?user=" + user;
-        s.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+        s.getOutputStream().write(("GET / HTTP/1.1\r\nHost: localhost:8081\r\nUpgrade: websocket\r\n"
                 + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-                + "Sec-WebSocket-Version: 13\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                + "Sec-WebSocket-Version: 13\r\n"
+                + (origin == null ? "" : "Origin: " + origin + "\r\n")
+                + (cookieHeader == null ? "" : "Cookie: " + cookieHeader + "\r\n")
+                + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
         return new Client(s);
+    }
+
+    /**
+     * Stands in for SessionService: tokens map to sessions in memory, and logging in also creates
+     * the user in the message store, as registering does for real.
+     */
+    private final class FakeSessions implements SessionAuthenticator {
+        record Session(String token, long id) { }
+
+        private final Map<String, AuthenticatedSession> byToken = new ConcurrentHashMap<>();
+        final Set<Long> revokedAfterAuth = ConcurrentHashMap.newKeySet();
+
+        synchronized Session login(String user, Duration ttl) {
+            store.addUser(user);
+            long id = byToken.size() + 1;
+            String token = "token-" + id;
+            byToken.put(token, new AuthenticatedSession(id, user, Instant.now().plus(ttl)));
+            return new Session(token, id);
+        }
+
+        @Override
+        public Optional<AuthenticatedSession> authenticate(String rawToken) {
+            return rawToken == null ? Optional.empty() : Optional.ofNullable(byToken.get(rawToken));
+        }
+
+        @Override
+        public boolean isActive(long sessionId) {
+            return !revokedAfterAuth.contains(sessionId);
+        }
     }
 
     private static void eventually(BooleanSupplier condition) throws InterruptedException {
@@ -345,6 +485,13 @@ class WsServerTest {
                 f.write(payload[i] ^ mask[i % 4]);
             }
             out.write(f.toByteArray());
+        }
+
+        /** Reads one server Close frame and returns its status code. */
+        int readCloseCode() throws IOException {
+            assertEquals(0x88, in.readUnsignedByte(), "expected a Close frame");
+            byte[] payload = readBytes(in.readUnsignedByte());
+            return ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
         }
 
         boolean isClosedByServer() throws IOException {

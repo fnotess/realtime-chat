@@ -1,5 +1,6 @@
 package com.sithija.chat.ws;
 
+import com.sithija.chat.ws.SessionAuthenticator.AuthenticatedSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -9,7 +10,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
-import java.net.URLDecoder;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
@@ -17,7 +17,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -65,6 +68,10 @@ public class WsServer {
     // How long to wait for a client to finish closing after we reject it (see drainBeforeClose).
     private static final int CLOSE_DRAIN_MS = 1_000;
 
+    // Application close code (4000-4999 are ours) for "your login session is over". Tells the
+    // client to go back to the login screen instead of reconnecting, which would only get a 401.
+    static final int CLOSE_SESSION_ENDED = 4001;
+
     private final WsProperties props;
     private final LongSupplier clock;
     // Shared builder so threads get sequential names (ws-conn-1, ws-conn-2...) in thread dumps.
@@ -74,20 +81,25 @@ public class WsServer {
     // Iteration is weakly consistent, so it never throws ConcurrentModificationException.
     private final Set<WsConnection> connections = ConcurrentHashMap.newKeySet();
     private final ConnectionRegistry registry = new ConnectionRegistry();
-    private final MessageStore store;
     private final MessageRouter router;
     // Open (or handshaking) connections per remote IP, for the reconnect-storm limit.
     private final ConcurrentHashMap<InetAddress, Integer> connectionsPerIp = new ConcurrentHashMap<>();
+    // Open connections per authenticated user: the primary connection limit.
+    private final ConcurrentHashMap<String, Integer> connectionsPerUser = new ConcurrentHashMap<>();
+    private final SessionAuthenticator sessions;
+    private final Set<String> allowedOrigins;
 
     private ServerSocket serverSocket;
     private Thread sweeper;
     // volatile: written by Spring's shutdown thread, read by the accept-loop thread.
     private volatile boolean running;
 
-    public WsServer(WsProperties props, LongSupplier clock, MessageStore store) {
+    public WsServer(WsProperties props, LongSupplier clock, MessageStore store, SessionAuthenticator sessions,
+                    List<String> allowedOrigins) {
         this.props = props;
         this.clock = clock;
-        this.store = store;
+        this.sessions = sessions;
+        this.allowedOrigins = Set.copyOf(allowedOrigins);
         this.router = new MessageRouter(registry, store);
     }
 
@@ -131,8 +143,20 @@ public class WsServer {
         }
     }
 
+    /**
+     * Closes every socket opened with this login session, after logout. The session row is
+     * already deleted, so a reconnect attempt gets a 401.
+     */
+    public void closeSession(long sessionId) {
+        for (WsConnection conn : connections) {
+            if (conn.belongsToSession(sessionId)) {
+                endSession(conn, "Logged out");
+            }
+        }
+    }
+
     /** The bound port. Useful when props.port() is 0 (tests pick a free ephemeral port). */
-    int localPort() {
+    public int localPort() {
         return serverSocket.getLocalPort();
     }
 
@@ -188,6 +212,10 @@ public class WsServer {
                             nanosToMillis(now - conn.writeStartedAt()), props.writeTimeout().toMillis());
                     closeQuietly(conn);
                 }
+                case SESSION_EXPIRED -> {
+                    log.info("Session expired for {}, closing", conn);
+                    endSession(conn, "Session expired");
+                }
                 case OK -> { }
             }
         }
@@ -195,6 +223,22 @@ public class WsServer {
 
     private static long nanosToMillis(long nanos) {
         return nanos / 1_000_000;
+    }
+
+    // Close with 4001, then drop the socket at once rather than waiting for the client's Close:
+    // the session is over, so nothing else the client sends should be processed. On its own
+    // virtual thread because sendClose() can wait for the write lock (the sweeper must not block,
+    // and logout shouldn't wait on a slow client).
+    private static void endSession(WsConnection conn, String reason) {
+        Thread.startVirtualThread(() -> {
+            try {
+                conn.sendClose(CLOSE_SESSION_ENDED, reason);
+            } catch (IOException e) {
+                // Already closing; closed below either way.
+            } finally {
+                closeQuietly(conn);
+            }
+        });
     }
 
     private static void closeQuietly(WsConnection conn) {
@@ -205,12 +249,13 @@ public class WsServer {
         }
     }
 
-    // compute() is atomic per key, so two handshakes racing from one IP can't both take the last slot.
-    private boolean tryAdmit(InetAddress ip) {
+    // compute() is atomic per key, so two handshakes racing for one IP or user can't both take
+    // the last slot.
+    private static <K> boolean tryAdmit(ConcurrentHashMap<K, Integer> counts, K key, int max) {
         boolean[] admitted = {false};
-        connectionsPerIp.compute(ip, (k, count) -> {
+        counts.compute(key, (k, count) -> {
             int current = count == null ? 0 : count;
-            if (current >= props.maxConnectionsPerIp()) {
+            if (current >= max) {
                 return count;
             }
             admitted[0] = true;
@@ -219,9 +264,9 @@ public class WsServer {
         return admitted[0];
     }
 
-    // Removes the entry at zero, so the map doesn't keep one entry for every IP ever seen.
-    private void release(InetAddress ip) {
-        connectionsPerIp.computeIfPresent(ip, (k, count) -> count == 1 ? null : count - 1);
+    // Removes the entry at zero, so the map doesn't keep one entry for every key ever seen.
+    private static <K> void release(ConcurrentHashMap<K, Integer> counts, K key) {
+        counts.computeIfPresent(key, (k, count) -> count == 1 ? null : count - 1);
     }
 
     private void acceptLoop() {
@@ -244,7 +289,9 @@ public class WsServer {
         // Decided at accept time, so half-finished handshakes count too, which also caps how
         // many slowloris sockets one IP can hold. The 429 is only sent once the request has
         // been read, so it's a proper HTTP response (see performHandshake).
-        boolean admitted = tryAdmit(ip);
+        boolean admitted = tryAdmit(connectionsPerIp, ip, props.maxConnectionsPerIp());
+        // Non-null once the handshake has authenticated the user and taken a per-user slot.
+        AuthenticatedSession session = null;
         // try-with-resources guarantees the socket is closed however this method exits,
         // so a crashed handler can't leak file descriptors.
         try (socket) {
@@ -257,10 +304,11 @@ public class WsServer {
             InputStream in = new BufferedInputStream(socket.getInputStream());
             OutputStream out = socket.getOutputStream();
 
-            String userId = performHandshake(in, out, admitted);
-            if (userId == null) {
+            session = performHandshake(in, out, admitted);
+            if (session == null) {
                 return;
             }
+            String userId = session.username();
             log.info("Handshake OK from {} as {}", socket.getRemoteSocketAddress(), userId);
 
             // After the handshake the connection is long-lived and idle most of the time,
@@ -277,14 +325,26 @@ public class WsServer {
             // that arrived together with the handshake aren't skipped.
             WsConnection conn = new WsConnection(socket, userId + "@" + addr, clock, props.sendQueueCapacity());
             WsFrameReader reader = new WsFrameReader(new DataInputStream(in), MAX_MESSAGE_BYTES, conn::markReceived);
+            conn.bindSession(session.sessionId(), expiryOnClock(session.expiresAt()));
             connections.add(conn);
             registry.register(userId, conn);
             conn.startWriter();
             // The finally unregisters even on exceptions, so neither the set nor the registry leaks.
             try (conn) {
-                // Handshake finished after stop() already sent its 1001s: close instead of serving.
+                // stop() has begun: close instead of serving. Send the 1001 here as well, because
+                // stop() may have sent its 1001s before this connection joined the set, or be racing
+                // us to it. sendClose() only sends while OPEN, so the client never gets two.
                 if (!running) {
+                    conn.sendClose(1001, "Server shutting down");
                     return;
+                }
+                // Logout race: logout deletes the session, then closes the sockets it finds in
+                // `connections`. A handshake that validated just before the delete, but was added
+                // just after that scan, would be missed and stay logged in until expiry. Checking
+                // again AFTER adding closes the gap: either the scan sees this connection, or this
+                // check sees the deleted session.
+                if (!sessions.isActive(session.sessionId())) {
+                    endSession(conn, "Logged out");
                 }
                 try {
                     WsFrame message;
@@ -330,10 +390,19 @@ public class WsServer {
         } catch (IOException e) {
             log.debug("Connection error: {}", e.getMessage());
         } finally {
+            if (session != null) {
+                release(connectionsPerUser, session.username());
+            }
             if (admitted) {
-                release(ip);
+                release(connectionsPerIp, ip);
             }
         }
+    }
+
+    // Sessions expire at a wall-clock Instant; the sweeper works in clock nanos. Converting once
+    // here is exact enough (session expiry is measured in days) and keeps all deadlines on one clock.
+    private long expiryOnClock(Instant expiresAt) {
+        return clock.getAsLong() + Duration.between(Instant.now(), expiresAt).toNanos();
     }
 
     /**
@@ -361,8 +430,8 @@ public class WsServer {
         }
     }
 
-    /** Returns the user id if the upgrade succeeded; otherwise writes an HTTP error and returns null. */
-    private String performHandshake(InputStream in, OutputStream out, boolean admitted) throws IOException {
+    /** Returns the session if the upgrade succeeded; otherwise writes an HTTP error and returns null. */
+    private AuthenticatedSession performHandshake(InputStream in, OutputStream out, boolean admitted) throws IOException {
         String requestLine = readLine(in);
         if (requestLine == null || !requestLine.startsWith("GET ")) {
             // RFC 6455 section 4.1: the opening handshake must be an HTTP GET.
@@ -395,59 +464,75 @@ public class WsServer {
             return null;
         }
 
-        // DEV ONLY: identity comes straight from the URL (ws://host:8081/?user=alice), so anyone
-        // can claim to be anyone. Phase 7 replaces this with the session cookie the browser
-        // sends on the upgrade request.
-        String userId = queryParam(requestLine, "user");
-        if (!MessageRouter.isValidUserId(userId)) {
-            writeHttpError(out, "400 Bad Request");
+        // Browsers don't apply CORS or the same-origin policy to WebSockets, and they attach
+        // cookies to the upgrade request whichever page opened it. Without this check, any site a
+        // logged-in user visits could open a socket as them and read their messages
+        // (Cross-Site WebSocket Hijacking). Browsers always send Origin and scripts can't change
+        // it. A missing Origin means a non-browser client, which is rejected too (fail closed).
+        // Null-checked first: Set.copyOf's contains(null) throws rather than returning false.
+        String origin = headers.get("origin");
+        if (origin == null || !allowedOrigins.contains(origin)) {
+            writeHttpError(out, "403 Forbidden");
             return null;
         }
 
-        // DEV ONLY: auto-creates the user, since there's no sign-up yet. Done before the 101, so a
-        // database outage is a clean 503 rather than a socket that can't store anything.
-        try {
-            store.ensureUser(userId);
-        } catch (RuntimeException e) {
-            log.warn("Could not create user {}", userId, e);
-            writeHttpError(out, "503 Service Unavailable");
-            return null;
-        }
-
-        // After reading the whole request, so the client gets a real HTTP response rather than
-        // a reset. A reconnect loop without backoff can open hundreds of sockets a second. The
-        // real fix is exponential backoff with jitter in the client; this stops one IP from
-        // exhausting the server's file descriptors meanwhile.
+        // Before the session lookup, so a flood from one IP costs no database queries. After
+        // reading the whole request, so the client gets a real HTTP response rather than a reset.
+        // A reconnect loop without backoff can open hundreds of sockets a second; the real fix is
+        // backoff with jitter in the client, and this keeps one IP from exhausting file
+        // descriptors meanwhile.
         if (!admitted) {
             writeHttpError(out, "429 Too Many Requests");
             return null;
         }
 
-        // TODO (Phase 7): check the Origin header and the session cookie here, before
-        // accepting. Browsers don't apply CORS to WebSockets, so without an Origin check
-        // any website a logged-in user visits could open a socket as them (CSWSH).
+        // The session cookie set by the REST login on :8080. Cookies are scoped by host, not
+        // port, so the browser sends it to :8081 too. That's what lets one login cover both.
+        AuthenticatedSession session;
+        try {
+            session = sessions.authenticate(cookie(headers.get("cookie"), SessionAuthenticator.COOKIE_NAME)).orElse(null);
+        } catch (RuntimeException e) {
+            // Database outage: a clean 503 rather than a socket that can't store anything.
+            log.warn("Session lookup failed", e);
+            writeHttpError(out, "503 Service Unavailable");
+            return null;
+        }
+        if (session == null) {
+            writeHttpError(out, "401 Unauthorized");
+            return null;
+        }
+
+        if (!tryAdmit(connectionsPerUser, session.username(), props.maxConnectionsPerUser())) {
+            writeHttpError(out, "429 Too Many Requests");
+            return null;
+        }
 
         String response = "HTTP/1.1 101 Switching Protocols\r\n"
                 + "Upgrade: websocket\r\n"
                 + "Connection: Upgrade\r\n"
                 + "Sec-WebSocket-Accept: " + computeAcceptKey(key) + "\r\n"
                 + "\r\n";
-        out.write(response.getBytes(StandardCharsets.ISO_8859_1));
-        out.flush();
-        return userId;
+        try {
+            out.write(response.getBytes(StandardCharsets.ISO_8859_1));
+            out.flush();
+        } catch (IOException e) {
+            // The caller only releases the user's slot for a returned session.
+            release(connectionsPerUser, session.username());
+            throw e;
+        }
+        return session;
     }
 
-    // "GET /?user=alice&x=1 HTTP/1.1" → "alice". Returns null if the parameter is absent.
-    private static String queryParam(String requestLine, String name) {
-        String[] parts = requestLine.split(" ");
-        int q = parts.length > 1 ? parts[1].indexOf('?') : -1;
-        if (q < 0) {
+    // "a=1; chat_session=xyz; b=2" → "xyz". Returns null if absent. Browsers send all cookies for
+    // the host in one header, separated by "; ". Never logged: the value is a live credential.
+    static String cookie(String header, String name) {
+        if (header == null) {
             return null;
         }
-        for (String pair : parts[1].substring(q + 1).split("&")) {
+        for (String pair : header.split(";")) {
             int eq = pair.indexOf('=');
-            if (eq > 0 && pair.substring(0, eq).equals(name)) {
-                return URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+            if (eq > 0 && pair.substring(0, eq).trim().equals(name)) {
+                return pair.substring(eq + 1).trim();
             }
         }
         return null;

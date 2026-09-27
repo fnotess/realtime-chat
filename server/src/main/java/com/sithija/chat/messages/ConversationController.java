@@ -1,11 +1,12 @@
 package com.sithija.chat.messages;
 
+import com.sithija.chat.auth.AuthFilter;
 import com.sithija.chat.messages.MessageRepository.ConversationSummary;
 import com.sithija.chat.messages.MessageRepository.MessageRow;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -17,8 +18,8 @@ import java.util.List;
  * Conversation list and message history over REST. Live messages arrive over the WebSocket;
  * this is for opening a chat, or catching up after being offline.
  *
- * DEV ONLY: the caller is whoever the X-Dev-User header claims to be. Phase 7 replaces it
- * with the session cookie.
+ * The caller is the session's user, resolved from the cookie by AuthFilter. Required, so a request
+ * that somehow skipped the filter fails with 400 instead of running as nobody.
  */
 @RestController
 @RequestMapping("/api/conversations")
@@ -39,16 +40,15 @@ public class ConversationController {
                                  String text, String clientMsgId, long ts) { }
 
     @GetMapping
-    public List<ConversationSummary> list(@RequestHeader(value = "X-Dev-User", required = false) String user) {
-        return repo.conversationsOf(requireUser(user));
+    public List<ConversationSummary> list(@RequestAttribute(AuthFilter.USERNAME) String me) {
+        return repo.conversationsOf(me);
     }
 
     @GetMapping("/{id}/messages")
-    public Page history(@RequestHeader(value = "X-Dev-User", required = false) String user,
+    public Page history(@RequestAttribute(AuthFilter.USERNAME) String me,
                         @PathVariable long id,
                         @RequestParam(required = false) Long beforeSeq,
                         @RequestParam(defaultValue = "50") int limit) {
-        String me = requireUser(user);
         // 404, not 403, for "exists but not yours": a 403 would confirm the id exists, letting
         // anyone enumerate conversation ids by probing.
         String other = repo.otherMember(id, me)
@@ -65,12 +65,5 @@ public class ConversationController {
         // A full page whose oldest seq is above 1 means older messages exist.
         Long next = rows.size() == pageSize && messages.getFirst().seq() > 1 ? messages.getFirst().seq() : null;
         return new Page(messages, next);
-    }
-
-    private static String requireUser(String user) {
-        if (user == null || user.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "X-Dev-User header required");
-        }
-        return user;
     }
 }

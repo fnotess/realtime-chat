@@ -20,6 +20,11 @@ public record WsProperties(
         @DefaultValue("10s") Duration writeTimeout,
         @DefaultValue("10s") Duration sweepInterval,
         @DefaultValue("2s") Duration shutdownGrace,
-        @DefaultValue("20") int maxConnectionsPerIp,
+        // The real limit: tabs and devices per account. Per user rather than per IP because
+        // many users can share one IP (NAT, an office), and one user can't dodge it by moving IP.
+        @DefaultValue("5") int maxConnectionsPerUser,
+        // Only a flood guard. Counted from accept, before the handshake, so it also caps
+        // unauthenticated and half-open sockets, which the per-user limit can't see.
+        @DefaultValue("100") int maxConnectionsPerIp,
         @DefaultValue("256") int sendQueueCapacity) {
 }

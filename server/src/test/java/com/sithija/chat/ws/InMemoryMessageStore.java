@@ -22,8 +22,7 @@ class InMemoryMessageStore implements MessageStore {
     private final Map<List<Object>, StoredMessage> byClientMsgId = new HashMap<>();
     private long nextId = 1;
 
-    @Override
-    public synchronized void ensureUser(String username) {
+    synchronized void addUser(String username) {
         users.add(username);
     }
 

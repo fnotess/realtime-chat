@@ -28,14 +28,6 @@ public class MessageRepository {
     public record ConversationSummary(long id, String otherUser, long lastSeq, String lastSender,
                                       String lastBody, Instant lastAt) { }
 
-    // ON CONFLICT DO NOTHING instead of "SELECT, then INSERT if missing": two first connects
-    // at once would both see no row, and the second INSERT would fail.
-    void ensureUser(String username) {
-        jdbc.sql("INSERT INTO users (username) VALUES (:username) ON CONFLICT (username) DO NOTHING")
-                .param("username", username)
-                .update();
-    }
-
     Optional<Long> findUserId(String username) {
         return jdbc.sql("SELECT id FROM users WHERE username = :username")
                 .param("username", username)

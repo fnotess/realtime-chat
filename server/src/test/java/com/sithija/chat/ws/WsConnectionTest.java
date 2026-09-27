@@ -111,7 +111,7 @@ class WsConnectionTest {
     @Test
     void stuckWriteIsDetectedAndClosingReleasesTheLock() throws Exception {
         WsProperties props = new WsProperties(0, Duration.ofSeconds(30), Duration.ofSeconds(10),
-                Duration.ofSeconds(10), Duration.ofSeconds(10), Duration.ofSeconds(2), 20, 16);
+                Duration.ofSeconds(10), Duration.ofSeconds(10), Duration.ofSeconds(2), 5, 20, 16);
         BlockingOutputStream socketOut = new BlockingOutputStream();
         WsConnection stuck = new WsConnection(socketOut, socketOut::close, now::get, "stuck", 16);
 

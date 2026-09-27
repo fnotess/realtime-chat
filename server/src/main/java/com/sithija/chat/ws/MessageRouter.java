@@ -1,6 +1,7 @@
 package com.sithija.chat.ws;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.sithija.chat.Usernames;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
@@ -25,7 +26,6 @@ public class MessageRouter {
     // Error replies echo clientMsgId even when it isn't a valid UUID, so cap what we reflect:
     // otherwise a client could make us send back arbitrarily large strings.
     private static final int MAX_CLIENT_MSG_ID_CHARS = 64;
-    private static final Pattern USER_ID = Pattern.compile("[A-Za-z0-9_-]{1,32}");
     // Canonical form only. UUID.fromString alone is lenient and accepts things like "1-1-1-1-1".
     private static final Pattern UUID_FORMAT =
             Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
@@ -37,10 +37,6 @@ public class MessageRouter {
     public MessageRouter(ConnectionRegistry registry, MessageStore store) {
         this.registry = registry;
         this.store = store;
-    }
-
-    static boolean isValidUserId(String userId) {
-        return userId != null && USER_ID.matcher(userId).matches();
     }
 
     record Ack(String type, String clientMsgId, long id, long conversationId, long seq, long ts) { }
@@ -128,7 +124,7 @@ public class MessageRouter {
         if (to == null || clientMsgId == null || text == null) {
             return "missing_field";
         }
-        if (!isValidUserId(to)) {
+        if (!Usernames.isValid(to)) {
             return "invalid_recipient";
         }
         if (to.equals(senderId)) {

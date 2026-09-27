@@ -25,11 +25,6 @@ public class MessageService implements MessageStore {
     }
 
     @Override
-    public void ensureUser(String username) {
-        repo.ensureUser(username);
-    }
-
-    @Override
     public StoredMessage save(String sender, String recipient, UUID clientMsgId, String text) {
         long senderId = repo.findUserId(sender).orElseThrow(() -> new IllegalStateException("Unknown sender " + sender));
         long recipientId = repo.findUserId(recipient).orElseThrow(() -> new UnknownRecipientException(recipient));

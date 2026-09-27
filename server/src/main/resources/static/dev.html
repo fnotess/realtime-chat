@@ -1,6 +1,7 @@
 <!doctype html>
 <!-- DEV ONLY: a throwaway page for trying the WebSocket protocol by hand. The React client
-     replaces it. Open two windows at http://localhost:8080/dev.html with different names. -->
+     replaces it. The session cookie is shared by every window of one browser profile, so to
+     chat as two users use a normal window plus a private/incognito one (or two browsers). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -18,9 +19,18 @@
 <h1>Chat dev page</h1>
 
 <fieldset>
+  <legend>Account</legend>
+  <input id="user" placeholder="username" autocomplete="username" autofocus>
+  <input id="password" type="password" placeholder="password (8+ chars)" autocomplete="current-password">
+  <button id="register">Register</button>
+  <button id="login">Log in</button>
+  <button id="logout" disabled>Log out</button>
+  <span id="whoami" class="sys">not logged in</span>
+</fieldset>
+
+<fieldset>
   <legend>Connection</legend>
-  <input id="user" placeholder="your username" autofocus>
-  <button id="connect">Connect</button>
+  <button id="connect" disabled>Connect</button>
   <span id="status" class="sys">disconnected</span>
 </fieldset>
 
@@ -48,16 +58,48 @@
     log(m.from === me ? 'out' : 'in', `#${m.seq} ${who}: ${m.text}`);
   }
 
+  // Same-origin fetches send the HttpOnly session cookie automatically (and Origin on POST, which
+  // the server checks). This script never sees the token itself.
+  function setLoggedIn(username) {
+    me = username;
+    $('whoami').textContent = username ? 'logged in as ' + username : 'not logged in';
+    $('logout').disabled = !username;
+    $('connect').disabled = !username;
+  }
+
+  async function auth(path) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('user').value, password: $('password').value }),
+    });
+    $('password').value = '';
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { log('err', `${path}: ${res.status} ${body.error || ''}`); return; }
+    setLoggedIn(body.username);
+    log('sys', 'logged in as ' + body.username);
+  }
+  $('register').onclick = () => auth('/api/auth/register');
+  $('login').onclick = () => auth('/api/auth/login');
+  $('logout').onclick = async () => {
+    // The server also closes this session's sockets (close code 4001).
+    await fetch('/api/auth/logout', { method: 'POST' });
+    setLoggedIn(null);
+    log('sys', 'logged out');
+  };
+
+  // Restore the login on page load if the cookie is still valid.
+  fetch('/api/auth/me').then(r => r.ok ? r.json() : null).then(b => b && setLoggedIn(b.username));
+
   // Opening a chat: fetch the latest page over REST (port 8080, same origin as this page), so
-  // messages sent while we were offline appear. X-Dev-User is the dev-only identity.
+  // messages sent while we were offline appear.
   async function loadHistory() {
     const to = $('to').value.trim();
     if (!me || !to) return;
-    const headers = { 'X-Dev-User': me };
-    const convs = await (await fetch('/api/conversations', { headers })).json();
+    const convs = await (await fetch('/api/conversations')).json();
     const conv = convs.find(c => c.otherUser === to);
     if (!conv) { log('sys', `no history with ${to} yet`); return; }
-    const page = await (await fetch(`/api/conversations/${conv.id}/messages?limit=50`, { headers })).json();
+    const page = await (await fetch(`/api/conversations/${conv.id}/messages?limit=50`)).json();
     log('sys', `— history with ${to} (${page.messages.length} messages${page.nextBeforeSeq ? ', older ones not shown' : ''}) —`);
     page.messages.forEach(showMessage);
   }
@@ -73,19 +115,20 @@
 
   $('connect').onclick = () => {
     if (ws) { ws.close(1000, 'bye'); return; }
-    const user = $('user').value.trim();
     // Same host as the page, WebSocket port 8081 unless the page URL has ?wsPort=... (for a second
-    // instance on other ports). ?user= is the dev-only identity; Phase 7 uses a cookie.
+    // instance on other ports). No identity in the URL: cookies are scoped by host, not port, so
+    // the browser sends the session cookie from :8080 on this upgrade to :8081 as well.
     const wsPort = new URLSearchParams(location.search).get('wsPort') || '8081';
-    ws = new WebSocket(`ws://${location.hostname}:${wsPort}/?user=${encodeURIComponent(user)}`);
+    ws = new WebSocket(`ws://${location.hostname}:${wsPort}/`);
+    let opened = false;
     $('status').textContent = 'connecting…';
 
     ws.onopen = () => {
-      me = user;
-      $('status').textContent = 'connected as ' + user;
+      opened = true;
+      $('status').textContent = 'connected as ' + me;
       $('connect').textContent = 'Disconnect';
       $('send').disabled = false;
-      log('sys', 'connected as ' + user);
+      log('sys', 'connected as ' + me);
       loadHistory(); // on reconnect, catch up on the open chat
     };
     ws.onmessage = (e) => {
@@ -103,7 +146,10 @@
       }
     };
     ws.onclose = (e) => {
-      log('sys', `closed (code ${e.code}${e.reason ? ', ' + e.reason : ''})`);
+      // Browsers hide the HTTP status of a rejected upgrade (401/403/429): all we get is 1006.
+      if (!opened) log('err', 'handshake rejected: not logged in, origin not allowed, or too many connections');
+      else log('sys', `closed (code ${e.code}${e.reason ? ', ' + e.reason : ''})`);
+      if (e.code === 4001) setLoggedIn(null); // session ended: log in again rather than reconnect
       $('status').textContent = 'disconnected';
       $('connect').textContent = 'Connect';
       $('send').disabled = true;

@@ -9,15 +9,12 @@ import java.util.UUID;
  */
 public interface MessageStore {
 
-    /** DEV ONLY: creates the user on first connect, because there's no sign-up until Phase 7. */
-    void ensureUser(String username);
-
     /**
      * Stores the message and returns only after it has COMMITTED, so the caller can ack and
      * fan out safely. A retry with the same (sender, clientMsgId) returns the original message,
      * with duplicate = true, and uses no new seq.
      *
-     * @throws UnknownRecipientException if the recipient has never connected
+     * @throws UnknownRecipientException if no account has that username
      */
     StoredMessage save(String sender, String recipient, UUID clientMsgId, String text);
 

@@ -54,6 +54,15 @@
 			<artifactId>jackson-databind</artifactId>
 		</dependency>
 
+		<!-- Only for BCryptPasswordEncoder. Password hashing is the one piece of auth that must not
+		     be hand-rolled; the rest of Spring Security (filter chain, session management) is
+		     deliberately not used, see AuthFilter. No transitive dependencies beyond spring-core.
+		     Version managed by the Spring Boot parent. -->
+		<dependency>
+			<groupId>org.springframework.security</groupId>
+			<artifactId>spring-security-crypto</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>

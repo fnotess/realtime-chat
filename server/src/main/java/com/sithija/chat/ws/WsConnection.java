@@ -29,7 +29,7 @@ public class WsConnection implements Closeable {
     enum State { OPEN, CLOSING, CLOSED }
 
     /** What the heartbeat sweeper should do with this connection. */
-    enum Liveness { OK, PING, DEAD, STUCK_WRITE }
+    enum Liveness { OK, PING, DEAD, STUCK_WRITE, SESSION_EXPIRED }
 
     private final OutputStream out;
     private final Closeable transport;
@@ -62,6 +62,14 @@ public class WsConnection implements Closeable {
     private final BlockingQueue<byte[]> sendQueue;
     private final AtomicBoolean overflowed = new AtomicBoolean();
     private volatile Thread writer;
+
+    // The login session this socket was authenticated with. Set once by bindSession() before the
+    // connection is published to the sweeper (through the concurrent connection set, which makes
+    // the writes visible), and never changed after. The expiry is in clock nanos, not wall time,
+    // so the sweeper compares it the same way as every other deadline, and tests can fake it.
+    private long sessionId;
+    private long sessionExpiresAt;
+    private boolean hasSession;
 
     public WsConnection(Socket socket, String label, LongSupplier clock, int sendQueueCapacity) throws IOException {
         this(socket.getOutputStream(), socket, clock, label, sendQueueCapacity);
@@ -139,6 +147,16 @@ public class WsConnection implements Closeable {
         });
     }
 
+    void bindSession(long sessionId, long expiresAtNanos) {
+        this.sessionId = sessionId;
+        this.sessionExpiresAt = expiresAtNanos;
+        this.hasSession = true;
+    }
+
+    boolean belongsToSession(long sessionId) {
+        return hasSession && this.sessionId == sessionId;
+    }
+
     /** Called by the reader for every inbound frame. Any frame proves the peer is alive, not just a pong. */
     void markReceived() {
         lastReceivedAt = clock.getAsLong();
@@ -156,6 +174,12 @@ public class WsConnection implements Closeable {
         // Checked first: the sweeper's ping to this client would only queue behind the stuck write.
         if (writing && now - writeStartedAt >= props.writeTimeout().toNanos()) {
             return Liveness.STUCK_WRITE;
+        }
+        // The handshake proved who this is only up to the session's expiry. Without this, a socket
+        // opened a minute before expiry would stay authenticated for as long as it stays connected.
+        // Only while OPEN: once our Close is out, repeating it would do nothing.
+        if (hasSession && state == State.OPEN && now - sessionExpiresAt >= 0) {
+            return Liveness.SESSION_EXPIRED;
         }
         if (pingOutstanding) {
             return now - pingSentAt >= props.pongTimeout().toNanos() ? Liveness.DEAD : Liveness.OK;

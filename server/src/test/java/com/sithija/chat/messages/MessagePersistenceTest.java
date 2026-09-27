@@ -2,11 +2,13 @@ package com.sithija.chat.messages;
 
 import com.sithija.chat.TestcontainersConfig;
 import com.sithija.chat.ws.MessageStore.StoredMessage;
+import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.web.servlet.MockMvc;
 import tools.jackson.databind.JsonNode;
@@ -14,8 +16,10 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -33,7 +38,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * ON CONFLICT, unique constraints) belong to the database. A fake would only test itself.
  * Every test uses fresh usernames, since all tests share one database.
  */
-@SpringBootTest(properties = "chat.ws.port=0")
+@SpringBootTest(properties = {"chat.ws.port=0", "chat.auth.bcrypt-cost=4"})
 @AutoConfigureMockMvc
 @Import(TestcontainersConfig.class)
 class MessagePersistenceTest {
@@ -46,6 +51,8 @@ class MessagePersistenceTest {
     MockMvc mvc;
 
     private final JsonMapper json = JsonMapper.builder().build();
+    // Session cookie per test user, from registering.
+    private final Map<String, Cookie> cookies = new ConcurrentHashMap<>();
 
     @Test
     void concurrentSendersGetDistinctConsecutiveSeqs() throws Exception {
@@ -192,9 +199,9 @@ class MessagePersistenceTest {
         long conversationId = service.save(alice, bob, UUID.randomUUID(), "private").conversationId();
 
         // Same response for "not yours" and "doesn't exist", so ids can't be probed.
-        mvc.perform(get("/api/conversations/" + conversationId + "/messages").header("X-Dev-User", carol))
+        mvc.perform(get("/api/conversations/" + conversationId + "/messages").cookie(cookies.get(carol)))
                 .andExpect(status().isNotFound());
-        mvc.perform(get("/api/conversations/999999999/messages").header("X-Dev-User", carol))
+        mvc.perform(get("/api/conversations/999999999/messages").cookie(cookies.get(carol)))
                 .andExpect(status().isNotFound());
         mvc.perform(get("/api/conversations/" + conversationId + "/messages"))
                 .andExpect(status().isUnauthorized());
@@ -202,9 +209,15 @@ class MessagePersistenceTest {
 
     // --- helpers ---
 
-    private String user(String prefix) {
+    /** Registers a fresh user through the real endpoint and keeps its session cookie. */
+    private String user(String prefix) throws Exception {
         String name = prefix + "_" + UUID.randomUUID().toString().substring(0, 8);
-        service.ensureUser(name);
+        Cookie cookie = mvc.perform(post("/api/auth/register").header("Origin", "http://localhost:8080")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"username\":\"" + name + "\",\"password\":\"password123\"}"))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getCookie("chat_session");
+        cookies.put(name, cookie);
         return name;
     }
 
@@ -214,7 +227,7 @@ class MessagePersistenceTest {
     }
 
     private JsonNode getJson(String url, String user) throws Exception {
-        String body = mvc.perform(get(url).header("X-Dev-User", user))
+        String body = mvc.perform(get(url).cookie(cookies.get(user)))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
         return json.readTree(body);

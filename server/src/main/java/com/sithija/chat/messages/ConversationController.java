@@ -33,7 +33,9 @@ public class ConversationController {
         this.repo = repo;
     }
 
-    public record Page(List<HistoryMessage> messages, Long nextBeforeSeq) { }
+    // hasMore: more messages exist in the direction being paged (older for beforeSeq, newer for
+    // afterSeq). nextBeforeSeq is the cursor for the next older page, null when paging forwards.
+    public record Page(List<HistoryMessage> messages, Long nextBeforeSeq, boolean hasMore) { }
 
     // Same field names as the WebSocket "message" payload, so the client renders both the same way.
     public record HistoryMessage(long id, long conversationId, long seq, String from, String to,
@@ -48,22 +50,39 @@ public class ConversationController {
     public Page history(@RequestAttribute(AuthFilter.USERNAME) String me,
                         @PathVariable long id,
                         @RequestParam(required = false) Long beforeSeq,
+                        @RequestParam(required = false) Long afterSeq,
                         @RequestParam(defaultValue = "50") int limit) {
+        if (beforeSeq != null && afterSeq != null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Use beforeSeq or afterSeq, not both");
+        }
         // 404, not 403, for "exists but not yours": a 403 would confirm the id exists, letting
         // anyone enumerate conversation ids by probing.
         String other = repo.otherMember(id, me)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
         int pageSize = Math.clamp(limit, 1, MAX_LIMIT);
 
+        if (afterSeq != null) {
+            // One extra row answers "is there more?" without a count query. The client keeps asking
+            // from its new last seq until hasMore is false, so a long offline period is fetched in
+            // bounded pages rather than one unbounded response.
+            List<MessageRow> after = repo.historyAfter(id, afterSeq, pageSize + 1);
+            boolean more = after.size() > pageSize;
+            return new Page(toHistory(more ? after.subList(0, pageSize) : after, me, other), null, more);
+        }
+
         List<MessageRow> rows = repo.historyBefore(id, beforeSeq == null ? Long.MAX_VALUE : beforeSeq, pageSize);
         // Fetched newest first (that's what LIMIT has to cut), returned oldest first for display.
-        List<HistoryMessage> messages = rows.reversed().stream()
+        List<HistoryMessage> messages = toHistory(rows.reversed(), me, other);
+        // A full page whose oldest seq is above 1 means older messages exist.
+        Long next = rows.size() == pageSize && messages.getFirst().seq() > 1 ? messages.getFirst().seq() : null;
+        return new Page(messages, next, next != null);
+    }
+
+    private static List<HistoryMessage> toHistory(List<MessageRow> rows, String me, String other) {
+        return rows.stream()
                 .map(r -> new HistoryMessage(r.id(), r.conversationId(), r.seq(), r.sender(),
                         r.sender().equals(me) ? other : me, r.body(), r.clientMsgId().toString(),
                         r.createdAt().toEpochMilli()))
                 .toList();
-        // A full page whose oldest seq is above 1 means older messages exist.
-        Long next = rows.size() == pageSize && messages.getFirst().seq() > 1 ? messages.getFirst().seq() : null;
-        return new Page(messages, next);
     }
 }

@@ -25,8 +25,14 @@ public class MessageRepository {
     public record MessageRow(long id, long conversationId, long seq, String sender, UUID clientMsgId,
                              String body, Instant createdAt) { }
 
+    // otherDeliveredSeq/otherReadSeq are the other member's watermarks (the ticks on my messages);
+    // unreadCount is their messages above my read watermark.
     public record ConversationSummary(long id, String otherUser, long lastSeq, String lastSender,
-                                      String lastBody, Instant lastAt) { }
+                                      String lastBody, Instant lastAt, long otherDeliveredSeq,
+                                      long otherReadSeq, long unreadCount) { }
+
+    /** A member's watermarks after a receipt, plus who to tell about them. */
+    record ReceiptRow(long conversationId, String otherUser, long deliveredSeq, long readSeq) { }
 
     Optional<Long> findUserId(String username) {
         return jdbc.sql("SELECT id FROM users WHERE username = :username")
@@ -117,12 +123,21 @@ public class MessageRepository {
         // per conversation, instead of scanning messages for the max.
         return jdbc.sql("""
                 SELECT c.id, other.username AS other_user, c.last_seq,
-                       sender.username AS last_sender, m.body AS last_body, m.created_at AS last_at
+                       sender.username AS last_sender, m.body AS last_body, m.created_at AS last_at,
+                       COALESCE(theirs.last_delivered_seq, 0) AS other_delivered_seq,
+                       COALESCE(theirs.last_read_seq, 0) AS other_read_seq,
+                       -- A range scan on the (conversation_id, seq) index from my watermark up.
+                       -- Only the other member's messages count: my own are never unread to me.
+                       (SELECT count(*) FROM messages u
+                        WHERE u.conversation_id = c.id AND u.seq > COALESCE(mine.last_read_seq, 0)
+                          AND u.sender_id <> me.id) AS unread_count
                 FROM users me
                 JOIN conversations c ON me.id IN (c.user_a_id, c.user_b_id)
                 JOIN users other ON other.id = CASE WHEN c.user_a_id = me.id THEN c.user_b_id ELSE c.user_a_id END
                 LEFT JOIN messages m ON m.conversation_id = c.id AND m.seq = c.last_seq
                 LEFT JOIN users sender ON sender.id = m.sender_id
+                LEFT JOIN conversation_receipts mine ON mine.conversation_id = c.id AND mine.user_id = me.id
+                LEFT JOIN conversation_receipts theirs ON theirs.conversation_id = c.id AND theirs.user_id = other.id
                 WHERE me.username = :username
                 ORDER BY m.created_at DESC NULLS LAST, c.id DESC
                 """)
@@ -130,7 +145,8 @@ public class MessageRepository {
                 .query((rs, n) -> new ConversationSummary(
                         rs.getLong("id"), rs.getString("other_user"), rs.getLong("last_seq"),
                         rs.getString("last_sender"), rs.getString("last_body"),
-                        toInstant(rs.getObject("last_at", OffsetDateTime.class))))
+                        toInstant(rs.getObject("last_at", OffsetDateTime.class)),
+                        rs.getLong("other_delivered_seq"), rs.getLong("other_read_seq"), rs.getLong("unread_count")))
                 .list();
     }
 
@@ -150,6 +166,63 @@ public class MessageRepository {
                 .param("limit", limit)
                 .query(MessageRepository::mapMessage)
                 .list();
+    }
+
+    /**
+     * Catch-up after a reconnect: up to `limit` messages after `afterSeq`, oldest first. The same
+     * index as historyBefore, scanned forwards. Seqs are gapless, so "everything after the last seq
+     * I have" is exactly what was missed.
+     */
+    public List<MessageRow> historyAfter(long conversationId, long afterSeq, int limit) {
+        return jdbc.sql(SELECT_MESSAGE + """
+                 WHERE m.conversation_id = :conversationId AND m.seq > :afterSeq
+                 ORDER BY m.seq ASC
+                 LIMIT :limit
+                """)
+                .param("conversationId", conversationId)
+                .param("afterSeq", afterSeq)
+                .param("limit", limit)
+                .query(MessageRepository::mapMessage)
+                .list();
+    }
+
+    /**
+     * Moves a member's watermarks up to `seq` (read also moves delivered: you can't read what you
+     * haven't received). Empty if the user isn't a member, the conversation doesn't exist, or seq
+     * is outside 1..last_seq: the three look the same to the caller, so receipts can't be used to
+     * probe conversation ids.
+     *
+     * GREATEST makes it monotonic: a late or duplicate receipt (two tabs, a retry, reordering
+     * between connections) can never move a watermark back. ON CONFLICT DO UPDATE applies GREATEST
+     * to the row as locked at update time, so concurrent receipts can't lose the higher value; a
+     * read-then-write in Java could.
+     */
+    Optional<ReceiptRow> recordReceipt(String username, long conversationId, long seq, boolean read) {
+        return jdbc.sql("""
+                WITH target AS (
+                    SELECT c.id AS conversation_id, me.id AS user_id, other.username AS other_user
+                    FROM conversations c
+                    JOIN users me ON me.username = :username AND me.id IN (c.user_a_id, c.user_b_id)
+                    JOIN users other ON other.id = CASE WHEN c.user_a_id = me.id THEN c.user_b_id ELSE c.user_a_id END
+                    WHERE c.id = :conversationId AND :seq BETWEEN 1 AND c.last_seq
+                ), upserted AS (
+                    INSERT INTO conversation_receipts AS r (conversation_id, user_id, last_delivered_seq, last_read_seq)
+                    SELECT conversation_id, user_id, :seq, :readSeq FROM target
+                    ON CONFLICT (conversation_id, user_id) DO UPDATE
+                    SET last_delivered_seq = GREATEST(r.last_delivered_seq, EXCLUDED.last_delivered_seq),
+                        last_read_seq = GREATEST(r.last_read_seq, EXCLUDED.last_read_seq)
+                    RETURNING conversation_id, last_delivered_seq, last_read_seq
+                )
+                SELECT u.conversation_id, t.other_user, u.last_delivered_seq, u.last_read_seq
+                FROM upserted u CROSS JOIN target t
+                """)
+                .param("username", username)
+                .param("conversationId", conversationId)
+                .param("seq", seq)
+                .param("readSeq", read ? seq : 0)
+                .query((rs, n) -> new ReceiptRow(rs.getLong("conversation_id"), rs.getString("other_user"),
+                        rs.getLong("last_delivered_seq"), rs.getLong("last_read_seq")))
+                .optional();
     }
 
     private static final String SELECT_MESSAGE = """

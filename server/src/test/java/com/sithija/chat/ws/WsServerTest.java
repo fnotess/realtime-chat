@@ -330,7 +330,94 @@ class WsServerTest {
         assertEquals("ack", alice.readJson().get("type").stringValue());
     }
 
+    @Test
+    void outboxResendAfterReconnectIsAckedButNotDeliveredTwice() throws Exception {
+        start(20);
+        Client bob = connect("bob");
+        Client alice = connect("alice");
+
+        alice.sendText(sendJson("bob", C1, "hello"));
+        JsonNode delivered = bob.readJson();
+        // The ack is lost: alice's connection drops before she reads it, so the message stays in her
+        // outbox and she resends it after reconnecting, with the same clientMsgId.
+        alice.socket.close();
+        eventually(() -> server.connectionCount() == 1);
+        Client alice2 = connect("alice");
+        alice2.sendText(sendJson("bob", C1, "hello"));
+
+        JsonNode ack = alice2.readJson();
+        assertEquals("ack", ack.get("type").stringValue());
+        assertEquals(delivered.get("id"), ack.get("id"), "same message, not a new one");
+        assertEquals(delivered.get("seq"), ack.get("seq"));
+        // Bob's next frame is the next real message, not a second copy of the first.
+        alice2.sendText(sendJson("bob", C2, "second"));
+        JsonNode next = bob.readJson();
+        assertEquals(C2, next.get("clientMsgId").stringValue());
+        assertEquals(2, next.get("seq").asLong());
+    }
+
+    @Test
+    void receiptIsPushedLiveToSenderAndReadersOtherTabs() throws Exception {
+        start(20);
+        Client alice = connect("alice");
+        Client bob = connect("bob");
+        Client bobPhone = connect("bob");
+        alice.sendText(sendJson("bob", C1, "hi"));
+        JsonNode ack = alice.readJson();
+        long conversationId = ack.get("conversationId").asLong();
+        bob.readJson();
+        bobPhone.readJson();
+
+        bob.sendText(receiptJson("read", conversationId, 1));
+
+        for (Client c : List.of(alice, bobPhone)) {
+            JsonNode r = c.readJson();
+            assertEquals("receipt", r.get("type").stringValue());
+            assertEquals(conversationId, r.get("conversationId").asLong());
+            assertEquals("bob", r.get("user").stringValue());
+            assertEquals(1, r.get("deliveredSeq").asLong(), "read implies delivered");
+            assertEquals(1, r.get("readSeq").asLong());
+        }
+        // The tab that sent the receipt gets nothing back (its next frame answers this one).
+        bob.sendText("{}");
+        assertEquals("error", bob.readJson().get("type").stringValue());
+    }
+
+    @Test
+    void outOfRangeOrNonMemberReceiptsAreRejected() throws Exception {
+        start(20);
+        Client alice = connect("alice");
+        connect("bob");
+        Client carol = connect("carol");
+        alice.sendText(sendJson("bob", C1, "hi"));
+        long conversationId = alice.readJson().get("conversationId").asLong();
+
+        String[][] cases = {
+                {receiptJson("read", conversationId, 2), "invalid_receipt"},       // beyond last seq
+                {receiptJson("delivered", 999, 1), "invalid_receipt"},             // no such conversation
+                {"{\"type\":\"read\",\"conversationId\":" + conversationId + ",\"seq\":0}", "missing_field"},
+                {"{\"type\":\"read\",\"conversationId\":" + conversationId + ",\"seq\":\"1\"}", "missing_field"},
+                {"{\"type\":\"read\",\"conversationId\":" + conversationId + ",\"seq\":1.5}", "missing_field"},
+        };
+        for (String[] c : cases) {
+            alice.sendText(c[0]);
+            JsonNode reply = alice.readJson();
+            assertEquals(c[1], reply.get("code").stringValue(), c[0]);
+        }
+        // Carol isn't in alice and bob's conversation: same answer as a conversation that doesn't exist.
+        carol.sendText(receiptJson("read", conversationId, 1));
+        assertEquals("invalid_receipt", carol.readJson().get("code").stringValue());
+        // Still open, and a valid receipt is accepted (no error back).
+        alice.sendText(receiptJson("read", conversationId, 1));
+        alice.sendText("{}");
+        assertEquals("unknown_type", alice.readJson().get("code").stringValue());
+    }
+
     // --- helpers ---
+
+    private static String receiptJson(String type, long conversationId, long seq) {
+        return "{\"type\":\"" + type + "\",\"conversationId\":" + conversationId + ",\"seq\":" + seq + "}";
+    }
 
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
@@ -371,6 +458,10 @@ class WsServerTest {
         assertEquals("HTTP/1.1 101 Switching Protocols", c.statusLine);
         // The server adds the connection just after writing the 101, on its own thread.
         eventually(() -> server.connectionCount() == before + 1);
+        // Registered for fan-out: the first frame on every accepted connection.
+        JsonNode ready = c.readJson();
+        assertEquals("ready", ready.get("type").stringValue());
+        assertEquals(session.username, ready.get("user").stringValue());
         return c;
     }
 
@@ -401,7 +492,7 @@ class WsServerTest {
      * the user in the message store, as registering does for real.
      */
     private final class FakeSessions implements SessionAuthenticator {
-        record Session(String token, long id) { }
+        record Session(String token, long id, String username) { }
 
         private final Map<String, AuthenticatedSession> byToken = new ConcurrentHashMap<>();
         final Set<Long> revokedAfterAuth = ConcurrentHashMap.newKeySet();
@@ -411,7 +502,7 @@ class WsServerTest {
             long id = byToken.size() + 1;
             String token = "token-" + id;
             byToken.put(token, new AuthenticatedSession(id, user, Instant.now().plus(ttl)));
-            return new Session(token, id);
+            return new Session(token, id, user);
         }
 
         @Override

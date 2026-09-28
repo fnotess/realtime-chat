@@ -44,6 +44,10 @@ public class MessageRouter {
     record Message(String type, long id, long conversationId, long seq, String from, String to,
                    String text, String clientMsgId, long ts) { }
 
+    record Ready(String type, String user) { }
+
+    record ReceiptPush(String type, long conversationId, String user, long deliveredSeq, long readSeq) { }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record ErrorReply(String type, String code, String message, String clientMsgId) { }
 
@@ -61,10 +65,26 @@ public class MessageRouter {
         }
         String clientMsgId = string(msg, "clientMsgId");
         String type = string(msg, "type");
-        if (!"send".equals(type)) {
-            reply(sender, error("unknown_type", "Unknown type: " + type, clientMsgId));
-            return;
+        switch (type == null ? "" : type) {
+            case "send" -> onSend(sender, senderId, msg, clientMsgId);
+            case "delivered" -> onReceipt(sender, senderId, msg, false);
+            case "read" -> onReceipt(sender, senderId, msg, true);
+            default -> reply(sender, error("unknown_type", "Unknown type: " + type, clientMsgId));
         }
+    }
+
+    /**
+     * Sent once the connection is registered for fan-out, which happens after the 101. A client
+     * that starts its catch-up fetch on "ready" (not on the browser's onopen) is guaranteed that
+     * every message committed after the fetch's query arrives live on this socket, so fetch plus
+     * live leaves no gap. Started on onopen instead, a message committed between the 101 and the
+     * registration would be in neither.
+     */
+    void sendReady(WsConnection conn, String user) {
+        reply(conn, new Ready("ready", user));
+    }
+
+    private void onSend(WsConnection sender, String senderId, JsonNode msg, String clientMsgId) {
         String to = string(msg, "to");
         String text = string(msg, "text");
         String problem = validateSend(senderId, to, clientMsgId, text);
@@ -116,6 +136,48 @@ public class MessageRouter {
         }
     }
 
+    /**
+     * {"type":"delivered"|"read","conversationId","seq"}: "I have received (read) everything up to
+     * seq". Clients coalesce these (one per conversation per burst, not one per message), and the
+     * store keeps only the highest, so resends and out-of-order receipts are harmless.
+     */
+    private void onReceipt(WsConnection conn, String user, JsonNode msg, boolean read) {
+        Long conversationId = positiveLong(msg, "conversationId");
+        Long seq = positiveLong(msg, "seq");
+        if (conversationId == null || seq == null) {
+            reply(conn, error("missing_field", "'conversationId' and 'seq' must be positive integers", null));
+            return;
+        }
+        MessageStore.Receipt receipt;
+        try {
+            receipt = store.recordReceipt(user, conversationId, seq, read).orElse(null);
+        } catch (RuntimeException e) {
+            // Safe to drop: the client sends a higher watermark with its next receipt anyway.
+            log.warn("Failed to store receipt from {}", user, e);
+            reply(conn, error("server_error", "Receipt not stored", null));
+            return;
+        }
+        if (receipt == null) {
+            // Not a member, no such conversation, or a seq that doesn't exist yet. One code for all
+            // three, like the REST 404, so receipts can't be used to probe conversation ids.
+            reply(conn, error("invalid_receipt", "No such message in a conversation of yours", null));
+            return;
+        }
+        // Current watermarks, not the delta, so a push that arrives late or twice can't move the
+        // other side's ticks backwards either: the client also keeps the max.
+        byte[] push = encode(new ReceiptPush("receipt", receipt.conversationId(), user,
+                receipt.deliveredSeq(), receipt.readSeq()));
+        for (WsConnection c : registry.connectionsOf(receipt.otherUser())) {
+            c.enqueueText(push);
+        }
+        // The user's other tabs too, so reading on one device clears the unread badge on the rest.
+        for (WsConnection c : registry.connectionsOf(user)) {
+            if (c != conn) {
+                c.enqueueText(push);
+            }
+        }
+    }
+
     void onBinary(WsConnection sender) {
         reply(sender, error("unsupported", "Binary frames are not part of the protocol", null));
     }
@@ -158,6 +220,16 @@ public class MessageRouter {
     private static String string(JsonNode node, String field) {
         JsonNode value = node.get(field);
         return value != null && value.isString() ? value.stringValue() : null;
+    }
+
+    // null unless an integer >= 1 that fits in a long ("5", 5.5 and 2^70 are all rejected).
+    private static Long positiveLong(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()) {
+            return null;
+        }
+        long v = value.longValue();
+        return v >= 1 ? v : null;
     }
 
     private static ErrorReply error(String code, String message, String clientMsgId) {

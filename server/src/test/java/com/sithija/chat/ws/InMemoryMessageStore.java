@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -20,10 +21,28 @@ class InMemoryMessageStore implements MessageStore {
     private final Map<List<String>, Long> conversations = new HashMap<>();
     private final Map<Long, Long> lastSeq = new HashMap<>();
     private final Map<List<Object>, StoredMessage> byClientMsgId = new HashMap<>();
+    // (conversationId, user) → {delivered, read}
+    private final Map<List<Object>, long[]> receipts = new HashMap<>();
     private long nextId = 1;
 
     synchronized void addUser(String username) {
         users.add(username);
+    }
+
+    @Override
+    public synchronized Optional<Receipt> recordReceipt(String user, long conversationId, long seq, boolean read) {
+        List<String> pair = conversations.entrySet().stream()
+                .filter(e -> e.getValue() == conversationId).map(Map.Entry::getKey).findFirst().orElse(null);
+        if (pair == null || !pair.contains(user) || seq < 1 || seq > lastSeq.getOrDefault(conversationId, 0L)) {
+            return Optional.empty();
+        }
+        long[] w = receipts.computeIfAbsent(List.of(conversationId, user), k -> new long[2]);
+        w[0] = Math.max(w[0], seq);
+        if (read) {
+            w[1] = Math.max(w[1], seq);
+        }
+        String other = pair.get(0).equals(user) ? pair.get(1) : pair.get(0);
+        return Optional.of(new Receipt(conversationId, user, other, w[0], w[1]));
     }
 
     @Override

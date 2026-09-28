@@ -1,6 +1,7 @@
 package com.sithija.chat.ws;
 
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -17,6 +18,15 @@ public interface MessageStore {
      * @throws UnknownRecipientException if no account has that username
      */
     StoredMessage save(String sender, String recipient, UUID clientMsgId, String text);
+
+    /**
+     * Raises the user's delivered (and, if read, read) watermark in the conversation to seq; never
+     * lowers it. Empty if the user isn't a member or seq is outside 1..the conversation's last seq.
+     */
+    Optional<Receipt> recordReceipt(String user, long conversationId, long seq, boolean read);
+
+    /** The user's watermarks after the update, and the other member, who should be told. */
+    record Receipt(long conversationId, String user, String otherUser, long deliveredSeq, long readSeq) { }
 
     record StoredMessage(long id, long conversationId, long seq, String from, String to,
                          UUID clientMsgId, String text, Instant createdAt, boolean duplicate) { }

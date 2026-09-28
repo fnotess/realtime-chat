@@ -6,6 +6,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -49,6 +50,13 @@ public class MessageService implements MessageStore {
                     .map(row -> toStored(row, sender, recipient, true))
                     .orElseThrow(() -> e);
         }
+    }
+
+    @Override
+    public Optional<Receipt> recordReceipt(String user, long conversationId, long seq, boolean read) {
+        // A single statement, so no TransactionTemplate: it's atomic on its own.
+        return repo.recordReceipt(user, conversationId, seq, read)
+                .map(r -> new Receipt(r.conversationId(), user, r.otherUser(), r.deliveredSeq(), r.readSeq()));
     }
 
     private static StoredMessage toStored(MessageRow row, String sender, String recipient, boolean duplicate) {

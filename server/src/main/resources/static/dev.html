@@ -1,18 +1,24 @@
 <!doctype html>
-<!-- DEV ONLY: a throwaway page for trying the WebSocket protocol by hand. The React client
-     replaces it. The session cookie is shared by every window of one browser profile, so to
-     chat as two users use a normal window plus a private/incognito one (or two browsers). -->
+<!-- DEV ONLY: a throwaway page for trying the protocol by hand; the React client replaces it.
+     The session cookie is shared by every window of one browser profile, so to chat as two users
+     use a normal window plus a private/incognito one (or two browsers). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chat dev page</title>
 <style>
-  body { font: 14px system-ui, sans-serif; max-width: 640px; margin: 16px auto; padding: 0 16px; }
+  body { font: 14px system-ui, sans-serif; max-width: 680px; margin: 16px auto; padding: 0 16px; }
   fieldset { margin-bottom: 12px; }
   input { margin-right: 6px; }
-  #log { border: 1px solid #ccc; height: 320px; overflow-y: auto; padding: 8px; font-family: monospace; white-space: pre-wrap; }
-  .in { color: #0a5; } .out { color: #06c; } .err { color: #c00; } .sys { color: #888; }
+  #convs span { cursor: pointer; margin-right: 12px; text-decoration: underline; }
+  #chat { border: 1px solid #ccc; height: 280px; overflow-y: auto; padding: 8px; }
+  #chat .me { text-align: right; color: #06c; }
+  #chat .them { color: #0a5; }
+  .tick { font-size: 12px; color: #888; margin-left: 6px; }
+  .tick.read { color: #0af; font-weight: bold; }
+  #log { height: 120px; overflow-y: auto; margin-top: 8px; font: 12px monospace; white-space: pre-wrap; color: #888; }
+  #log .err { color: #c00; }
 </style>
 </head>
 <body>
@@ -25,41 +31,45 @@
   <button id="register">Register</button>
   <button id="login">Log in</button>
   <button id="logout" disabled>Log out</button>
-  <span id="whoami" class="sys">not logged in</span>
+  <span id="whoami">not logged in</span>
 </fieldset>
 
 <fieldset>
   <legend>Connection</legend>
-  <button id="connect" disabled>Connect</button>
-  <span id="status" class="sys">disconnected</span>
+  <button id="connect" disabled>Disconnect</button>
+  <span id="status">disconnected</span>
 </fieldset>
 
 <fieldset>
-  <legend>Send</legend>
-  <input id="to" placeholder="to (username)" title="History loads when you leave this field">
+  <legend>Chat</legend>
+  <div id="convs"></div>
+  <input id="to" placeholder="to (username)">
   <input id="text" placeholder="message" size="30">
-  <button id="send" disabled>Send</button>
+  <button id="send">Send</button>
 </fieldset>
 
+<div id="chat"></div>
 <div id="log"></div>
 
 <script>
   const $ = (id) => document.getElementById(id);
-  let ws = null;
+  const wsPort = new URLSearchParams(location.search).get('wsPort') || '8081';
+
   let me = null;
-  // Message ids already shown. History and live delivery can overlap (a message can arrive
-  // over the socket while its history page is loading), so both paths skip ids seen before.
-  const shown = new Set();
+  let ws = null;
+  let ready = false;          // socket registered for fan-out (the server's "ready" frame)
+  let wantConnected = false;  // false after logout or a manual disconnect: don't auto-reconnect
+  let attempt = 0;
+  let reconnectTimer = null;
 
-  function showMessage(m) {
-    if (shown.has(m.id)) return;
-    shown.add(m.id);
-    const who = m.from === me ? `you → ${m.to}` : `${m.from} → you`;
-    log(m.from === me ? 'out' : 'in', `#${m.seq} ${who}: ${m.text}`);
-  }
+  // conversationId → { id, other, msgs: Map<id, msg>, seqs: Set, upTo, lastSeq, otherDelivered,
+  // otherRead, unread }. upTo is the highest seq we hold with no gaps below it (down to where we
+  // started loading); null until the chat is opened. It's the cursor for the catch-up fetch.
+  const convs = new Map();
+  const convByOther = (name) => [...convs.values()].find(c => c.other === name);
 
-  // Same-origin fetches send the HttpOnly session cookie automatically (and Origin on POST, which
-  // the server checks). This script never sees the token itself.
+  // ---- account ----------------------------------------------------------------------------
+
   function setLoggedIn(username) {
     me = username;
     $('whoami').textContent = username ? 'logged in as ' + username : 'not logged in';
@@ -75,97 +85,369 @@
     });
     $('password').value = '';
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) { log('err', `${path}: ${res.status} ${body.error || ''}`); return; }
-    setLoggedIn(body.username);
-    log('sys', 'logged in as ' + body.username);
+    if (!res.ok) { log(`${path}: ${res.status} ${body.error || ''}`, true); return; }
+    startSession(body.username);
   }
   $('register').onclick = () => auth('/api/auth/register');
   $('login').onclick = () => auth('/api/auth/login');
   $('logout').onclick = async () => {
-    // The server also closes this session's sockets (close code 4001).
-    await fetch('/api/auth/logout', { method: 'POST' });
-    setLoggedIn(null);
-    log('sys', 'logged out');
+    wantConnected = false;
+    await fetch('/api/auth/logout', { method: 'POST' }); // the server closes our sockets (4001)
+    endSession();
   };
 
-  // Restore the login on page load if the cookie is still valid.
-  fetch('/api/auth/me').then(r => r.ok ? r.json() : null).then(b => b && setLoggedIn(b.username));
-
-  // Opening a chat: fetch the latest page over REST (port 8080, same origin as this page), so
-  // messages sent while we were offline appear.
-  async function loadHistory() {
-    const to = $('to').value.trim();
-    if (!me || !to) return;
-    const convs = await (await fetch('/api/conversations')).json();
-    const conv = convs.find(c => c.otherUser === to);
-    if (!conv) { log('sys', `no history with ${to} yet`); return; }
-    const page = await (await fetch(`/api/conversations/${conv.id}/messages?limit=50`)).json();
-    log('sys', `— history with ${to} (${page.messages.length} messages${page.nextBeforeSeq ? ', older ones not shown' : ''}) —`);
-    page.messages.forEach(showMessage);
+  function startSession(username) {
+    setLoggedIn(username);
+    convs.clear();
+    loadOutbox();
+    wantConnected = true;
+    connect();
   }
-  $('to').onchange = loadHistory;
 
-  function log(cls, line) {
-    const div = document.createElement('div');
-    div.className = cls;
-    div.textContent = new Date().toLocaleTimeString() + '  ' + line;
-    $('log').appendChild(div);
-    $('log').scrollTop = $('log').scrollHeight;
+  function endSession() {
+    wantConnected = false;
+    clearTimeout(reconnectTimer);
+    if (ws) ws.close(1000, 'logout');
+    sessionStorage.removeItem(outboxKey());
+    setLoggedIn(null);
+    convs.clear();
+    outbox.clear();
+    render();
+  }
+
+  // A refresh keeps the (HttpOnly) cookie, so pick up where we were: connect, and reopen the
+  // chat that was open. sessionStorage is per tab, so each tab restores its own chat.
+  $('to').value = sessionStorage.getItem('chat.to') || '';
+  fetch('/api/auth/me').then(r => r.ok ? r.json() : null).then(b => b && startSession(b.username));
+
+  // ---- connection -------------------------------------------------------------------------
+
+  function connect() {
+    clearTimeout(reconnectTimer);
+    if (ws || !wantConnected) return;
+    // No identity in the URL: cookies are scoped by host, not port, so the session cookie from
+    // :8080 goes on this upgrade to :8081 as well.
+    const socket = new WebSocket(`ws://${location.hostname}:${wsPort}/`);
+    ws = socket;
+    let opened = false;
+    $('status').textContent = 'connecting…';
+    socket.onopen = () => { opened = true; };
+    socket.onmessage = (e) => onFrame(JSON.parse(e.data));
+    socket.onclose = async (e) => {
+      ws = null;
+      ready = false;
+      $('status').textContent = 'disconnected';
+      $('connect').textContent = 'Connect';
+      if (e.code === 4001) { log('session ended: ' + e.reason); endSession(); return; }
+      if (!opened) {
+        // A rejected upgrade shows up only as 1006 (browsers hide the 401/403/429), so ask REST.
+        // If that fails too, the server is down: keep backing off.
+        const status = await fetch('/api/auth/me').then(r => r.status, () => 0);
+        if (status === 401) { log('not logged in'); endSession(); return; }
+      }
+      if (wantConnected) scheduleReconnect(e.code);
+    };
+  }
+
+  // Exponential backoff with "full jitter": a random delay between 0 and min(30s, 1s × 2^attempt).
+  // The exponent keeps a down server from being hammered; the randomness is what prevents the
+  // reconnect storm. When the server restarts, every client loses its socket at the same moment.
+  // With a fixed schedule they would all come back at 1s, 2s, 4s… in lockstep: one spike of
+  // handshakes and catch-up fetches per step (the flood the per-IP limit was added for). Spread
+  // uniformly, the same reconnects arrive as a trickle.
+  function scheduleReconnect(code) {
+    const delay = Math.random() * Math.min(30000, 1000 * 2 ** attempt);
+    attempt++;
+    log(`closed (${code}), reconnecting in ${(delay / 1000).toFixed(1)}s`);
+    reconnectTimer = setTimeout(connect, delay);
   }
 
   $('connect').onclick = () => {
-    if (ws) { ws.close(1000, 'bye'); return; }
-    // Same host as the page, WebSocket port 8081 unless the page URL has ?wsPort=... (for a second
-    // instance on other ports). No identity in the URL: cookies are scoped by host, not port, so
-    // the browser sends the session cookie from :8080 on this upgrade to :8081 as well.
-    const wsPort = new URLSearchParams(location.search).get('wsPort') || '8081';
-    ws = new WebSocket(`ws://${location.hostname}:${wsPort}/`);
-    let opened = false;
-    $('status').textContent = 'connecting…';
-
-    ws.onopen = () => {
-      opened = true;
-      $('status').textContent = 'connected as ' + me;
-      $('connect').textContent = 'Disconnect';
-      $('send').disabled = false;
-      log('sys', 'connected as ' + me);
-      loadHistory(); // on reconnect, catch up on the open chat
-    };
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === 'message') {
-        // Includes our own messages sent from another tab (from === us).
-        showMessage(m);
-      } else if (m.type === 'ack') {
-        shown.add(m.id); // already shown locally when sent
-        log('sys', `ack → id ${m.id}, seq #${m.seq}`);
-      } else if (m.type === 'error') {
-        log('err', `error ${m.code}: ${m.message}`);
-      } else {
-        log('sys', 'unknown: ' + e.data);
-      }
-    };
-    ws.onclose = (e) => {
-      // Browsers hide the HTTP status of a rejected upgrade (401/403/429): all we get is 1006.
-      if (!opened) log('err', 'handshake rejected: not logged in, origin not allowed, or too many connections');
-      else log('sys', `closed (code ${e.code}${e.reason ? ', ' + e.reason : ''})`);
-      if (e.code === 4001) setLoggedIn(null); // session ended: log in again rather than reconnect
-      $('status').textContent = 'disconnected';
-      $('connect').textContent = 'Connect';
-      $('send').disabled = true;
-      ws = null;
-    };
+    if (ws) { wantConnected = false; ws.close(1000, 'bye'); log('disconnected by you'); }
+    else { wantConnected = true; attempt = 0; connect(); }
   };
 
+  // ---- sync -------------------------------------------------------------------------------
+  //
+  // Order: subscribe first, then fetch. The socket is registered before "ready", so anything
+  // committed after our fetch arrives live; anything committed before it is in the fetch. Messages
+  // in both are merged by id. The reverse order (fetch, then open the socket) leaves a gap: a
+  // message committed after the fetch but before the socket is registered is in neither, and stays
+  // missing until the next reconnect.
+  //
+  // Live messages that arrive during the fetch are buffered, so upTo only advances once the
+  // fetched ones are in and a live message can't be counted before the older ones it follows.
+
+  let syncing = false;
+  let buffered = [];
+
+  async function onReady(user) {
+    ready = true;
+    attempt = 0; // reset on ready, not onopen: a socket that opens and is closed straight away
+                 // (1008, a server bounce) must keep backing off
+    $('status').textContent = 'connected as ' + user;
+    $('connect').textContent = 'Disconnect';
+    syncing = true;
+    buffered = [];
+    // A receipt sent just before the last disconnect may have been lost; send current watermarks
+    // again once. Harmless if it wasn't: the server keeps the max.
+    for (const c of convs.values()) { c.sentDelivered = 0; c.sentRead = 0; }
+    try {
+      await sync();
+    } catch (err) {
+      log('sync failed, will retry on reconnect: ' + err, true);
+    }
+    syncing = false;
+    buffered.forEach(applyMessage);
+    buffered = [];
+    resendOutbox();
+    render();
+  }
+
+  async function sync() {
+    const list = await getJson('/api/conversations');
+    for (const s of list) {
+      const c = ensureConv(s.id, s.otherUser);
+      c.lastSeq = Math.max(c.lastSeq, s.lastSeq);
+      c.otherDelivered = Math.max(c.otherDelivered, s.otherDeliveredSeq);
+      c.otherRead = Math.max(c.otherRead, s.otherReadSeq);
+      // Only chats we've opened are caught up message by message; for the rest the summary (last
+      // seq, unread count) is enough until they're opened.
+      if (c.upTo !== null && c.lastSeq > c.upTo) {
+        let page;
+        do {
+          page = await getJson(`/api/conversations/${c.id}/messages?afterSeq=${c.upTo}&limit=100`);
+          page.messages.forEach(applyMessage);
+        } while (page.hasMore && page.messages.length);
+      }
+      // The server's count covers every message up to its lastSeq; set after the fetch, which
+      // counts as it applies. Only messages above `counted` add to it from here on.
+      c.unread = s.unreadCount;
+      c.counted = s.lastSeq;
+      // This device now knows about everything up to lastSeq.
+      if (c.lastSeq > 0) queueReceipt(c, c.lastSeq, false);
+    }
+    await openChat();
+  }
+
+  async function openChat() {
+    const to = $('to').value.trim();
+    sessionStorage.setItem('chat.to', to);
+    const c = convByOther(to);
+    if (c && c.upTo === null) {
+      // First open: the latest page. Everything older is reachable with beforeSeq (not wired up here).
+      const page = await getJson(`/api/conversations/${c.id}/messages?limit=50`);
+      c.upTo = page.messages.length ? page.messages[0].seq - 1 : 0;
+      page.messages.forEach(applyMessage);
+      // Also counts messages we already held from the socket, which applyMessage skips as known.
+      while (c.seqs.has(c.upTo + 1)) c.upTo++;
+    }
+    render();
+  }
+  $('to').onchange = () => openChat();
+
+  function ensureConv(id, other) {
+    if (!convs.has(id)) {
+      convs.set(id, { id, other, msgs: new Map(), seqs: new Set(), upTo: null, lastSeq: 0,
+                      otherDelivered: 0, otherRead: 0, unread: 0, counted: 0, sentDelivered: 0, sentRead: 0 });
+    }
+    return convs.get(id);
+  }
+
+  // Idempotent: the same message from history and from the socket is stored once (keyed by id).
+  function applyMessage(m) {
+    const c = ensureConv(m.conversationId, m.from === me ? m.to : m.from);
+    if (c.msgs.has(m.id)) return c;
+    c.msgs.set(m.id, m);
+    c.seqs.add(m.seq);
+    c.lastSeq = Math.max(c.lastSeq, m.seq);
+    if (c.upTo !== null) while (c.seqs.has(c.upTo + 1)) c.upTo++;
+    if (m.from !== me) {
+      if (!isOpenAndVisible(c) && m.seq > c.counted) c.unread++;
+      queueReceipt(c, m.seq, false);
+    }
+    return c;
+  }
+
+  // A chat that appears while it's the open one (first message either way) has no history cursor
+  // yet: load it like an explicit open, so reads and reconnect catch-up cover it.
+  function applyLive(m) {
+    const c = applyMessage(m);
+    if (c.upTo === null && c.other === $('to').value.trim()) openChat(); else render();
+  }
+
+  function onFrame(f) {
+    switch (f.type) {
+      case 'ready': onReady(f.user); break;
+      case 'message':
+        if (syncing) buffered.push(f); else applyLive(f);
+        break;
+      case 'ack': {
+        const pending = outbox.get(f.clientMsgId);
+        outbox.delete(f.clientMsgId);
+        saveOutbox();
+        if (pending) {
+          applyLive({ id: f.id, conversationId: f.conversationId, seq: f.seq, from: me,
+                      to: pending.to, text: pending.text, clientMsgId: f.clientMsgId, ts: f.ts });
+        } else {
+          render();
+        }
+        break;
+      }
+      case 'receipt': {
+        const c = convs.get(f.conversationId);
+        if (!c) break;
+        if (f.user === me) {
+          // Read on another tab or device: clear the badge here too.
+          if (f.readSeq >= c.lastSeq) c.unread = 0;
+        } else {
+          c.otherDelivered = Math.max(c.otherDelivered, f.deliveredSeq);
+          c.otherRead = Math.max(c.otherRead, f.readSeq);
+        }
+        render();
+        break;
+      }
+      case 'error':
+        log(`error ${f.code}: ${f.message}`, true);
+        // server_error: nothing was stored, so keep it in the outbox for the next reconnect.
+        // Anything else (unknown recipient, too long…) will never succeed: drop it.
+        if (f.clientMsgId && f.code !== 'server_error') { outbox.delete(f.clientMsgId); saveOutbox(); render(); }
+        break;
+    }
+  }
+
+  // ---- outbox -----------------------------------------------------------------------------
+  //
+  // Every send stays here until its ack. After a reconnect, whatever is left is resent with the
+  // SAME clientMsgId: if the first attempt was stored and only the ack was lost, the server's
+  // unique (sender, clientMsgId) turns the resend into a re-ack of the original, not a duplicate.
+  // sessionStorage (per tab, survives a refresh) rather than localStorage: two tabs sharing one
+  // outbox would both resend the same items.
+
+  const outbox = new Map(); // clientMsgId → { to, text, clientMsgId }, in send order
+  const outboxKey = () => 'chat.outbox.' + me;
+  function loadOutbox() {
+    outbox.clear();
+    for (const m of JSON.parse(sessionStorage.getItem(outboxKey()) || '[]')) outbox.set(m.clientMsgId, m);
+  }
+  function saveOutbox() { if (me) sessionStorage.setItem(outboxKey(), JSON.stringify([...outbox.values()])); }
+  function resendOutbox() {
+    for (const m of outbox.values()) ws.send(JSON.stringify({ type: 'send', ...m }));
+  }
+
   function send() {
+    const to = $('to').value.trim();
     const text = $('text').value;
-    const msg = { type: 'send', to: $('to').value.trim(), clientMsgId: crypto.randomUUID(), text };
-    ws.send(JSON.stringify(msg));
-    log('out', `you → ${msg.to}: ${text}`);
+    if (!me || !to || !text.trim()) return;
+    const m = { to, text, clientMsgId: crypto.randomUUID() };
+    outbox.set(m.clientMsgId, m);
+    saveOutbox();
+    // Not ready (offline or mid-sync): it goes out with resendOutbox once the socket is ready.
+    if (ready && !syncing) ws.send(JSON.stringify({ type: 'send', ...m }));
     $('text').value = '';
+    render();
   }
   $('send').onclick = send;
-  $('text').onkeydown = (e) => { if (e.key === 'Enter' && !$('send').disabled) send(); };
+  $('text').onkeydown = (e) => { if (e.key === 'Enter') send(); };
+
+  // ---- receipts ---------------------------------------------------------------------------
+  //
+  // Receipts are watermarks, so only the highest seq per conversation matters. Collect for a short
+  // while and send one per conversation, instead of one frame per message (a catch-up of 200
+  // messages is one "delivered", not 200). A read covers delivered.
+
+  const RECEIPT_DELAY_MS = 300;
+  let receiptTimer = null;
+
+  function queueReceipt(c, seq, read) {
+    c.wantDelivered = Math.max(c.wantDelivered || 0, seq);
+    if (read) c.wantRead = Math.max(c.wantRead || 0, seq);
+    if (!receiptTimer) receiptTimer = setTimeout(flushReceipts, RECEIPT_DELAY_MS);
+  }
+
+  function flushReceipts() {
+    receiptTimer = null;
+    if (!ready) return; // kept in want*; sent after the next sync
+    for (const c of convs.values()) {
+      if ((c.wantRead || 0) > c.sentRead) {
+        ws.send(JSON.stringify({ type: 'read', conversationId: c.id, seq: c.wantRead }));
+        c.sentRead = c.wantRead;
+        c.sentDelivered = Math.max(c.sentDelivered, c.wantRead);
+      } else if ((c.wantDelivered || 0) > c.sentDelivered) {
+        ws.send(JSON.stringify({ type: 'delivered', conversationId: c.id, seq: c.wantDelivered }));
+        c.sentDelivered = c.wantDelivered;
+      }
+    }
+  }
+
+  const isOpenAndVisible = (c) => c.other === $('to').value.trim() && document.visibilityState === 'visible';
+
+  // Read = the open chat, in a visible tab, up to the last message we hold without gaps.
+  function markOpenChatRead() {
+    const c = convByOther($('to').value.trim());
+    if (c && c.upTo > 0 && isOpenAndVisible(c)) {
+      c.unread = 0;
+      queueReceipt(c, c.upTo, true);
+    }
+  }
+  document.addEventListener('visibilitychange', () => { markOpenChatRead(); render(); });
+
+  // ---- rendering --------------------------------------------------------------------------
+  // textContent only: message text is untrusted input.
+
+  function render() {
+    markOpenChatRead();
+    const list = $('convs');
+    list.replaceChildren(...[...convs.values()].map(c => {
+      const s = document.createElement('span');
+      s.textContent = c.other + (c.unread ? ` (${c.unread})` : '');
+      s.onclick = () => { $('to').value = c.other; openChat(); };
+      return s;
+    }));
+
+    const to = $('to').value.trim();
+    const c = convByOther(to);
+    const rows = c ? [...c.msgs.values()].sort((a, b) => a.seq - b.seq) : [];
+    const pending = [...outbox.values()].filter(m => m.to === to);
+    $('chat').replaceChildren(
+      ...rows.map(m => line(m.from === me, `#${m.seq} ${m.text}`, m.from === me ? tick(c, m.seq) : null)),
+      ...pending.map(m => line(true, m.text, ['🕓', ''])));
+    $('chat').scrollTop = $('chat').scrollHeight;
+  }
+
+  // ✓ stored (acked), ✓✓ delivered to one of their devices, coloured ✓✓ read.
+  function tick(c, seq) {
+    if (seq <= c.otherRead) return ['✓✓', 'read'];
+    if (seq <= c.otherDelivered) return ['✓✓', ''];
+    return ['✓', ''];
+  }
+
+  function line(mine, text, t) {
+    const div = document.createElement('div');
+    div.className = mine ? 'me' : 'them';
+    div.textContent = text;
+    if (t) {
+      const span = document.createElement('span');
+      span.className = 'tick ' + t[1];
+      span.textContent = t[0];
+      div.appendChild(span);
+    }
+    return div;
+  }
+
+  async function getJson(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: ${res.status}`);
+    return res.json();
+  }
+
+  function log(text, isError) {
+    const div = document.createElement('div');
+    if (isError) div.className = 'err';
+    div.textContent = new Date().toLocaleTimeString() + '  ' + text;
+    $('log').appendChild(div);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
 </script>
 </body>
 </html>

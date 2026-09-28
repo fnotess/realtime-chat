@@ -345,6 +345,8 @@ public class WsServer {
                 // check sees the deleted session.
                 if (!sessions.isActive(session.sessionId())) {
                     endSession(conn, "Logged out");
+                } else {
+                    router.sendReady(conn, userId);
                 }
                 try {
                     WsFrame message;

@@ -1,0 +1,716 @@
+:root {
+  --bg: #eef1f4;
+  --panel: #ffffff;
+  --panel-2: #f6f7f9;
+  --chat-bg: #efeae2;
+  --border: #e3e6ea;
+  --text: #1c2228;
+  --muted: #6b7680;
+  --accent: #128c7e;
+  --mine: #d9fdd3;
+  --theirs: #ffffff;
+  --read: #1d9bf0;
+  --danger: #c62828;
+  --danger-bg: #fdecea;
+  --banner: #fff4cc;
+  --banner-text: #5c4a00;
+  --shadow: 0 1px 1px rgb(0 0 0 / 0.08);
+  --radius: 10px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c1317;
+    --panel: #111b21;
+    --panel-2: #1a252c;
+    --chat-bg: #0b141a;
+    --border: #25323a;
+    --text: #e9edef;
+    --muted: #8696a0;
+    --accent: #00a884;
+    --mine: #005c4b;
+    --theirs: #202c33;
+    --read: #53bdeb;
+    --danger: #ff6b6b;
+    --danger-bg: #3a1d1d;
+    --banner: #3d3510;
+    --banner-text: #f2e3a6;
+    --shadow: 0 1px 1px rgb(0 0 0 / 0.3);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button.link {
+  background: none;
+  border: 0;
+  padding: 4px 6px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 8px;
+  padding: 11px 16px;
+  font-weight: 600;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+}
+
+.splash {
+  height: 100%;
+}
+
+/* ---- auth ------------------------------------------------------------------------------------ */
+
+.auth {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 28px;
+  box-shadow: 0 8px 30px rgb(0 0 0 / 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-title {
+  margin: 0 0 4px;
+  font-size: 24px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  background: var(--panel-2);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.auth-tabs button {
+  border: 0;
+  background: none;
+  padding: 8px;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.auth-tabs button.active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-weight: 600;
+}
+
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.auth-card input {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 15px;
+  font-weight: 400;
+}
+
+.hint {
+  margin: -6px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.auth-error,
+.auth-notice {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.auth-error {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.auth-notice {
+  background: var(--banner);
+  color: var(--banner-text);
+}
+
+/* ---- layout ---------------------------------------------------------------------------------- */
+
+.layout {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(250px, 340px) 1fr;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    'banner banner'
+    'sidebar pane';
+  max-width: 1400px;
+  margin: 0 auto;
+  background: var(--panel);
+}
+
+@media (min-width: 1440px) {
+  .layout {
+    height: calc(100% - 38px);
+    margin-top: 19px;
+    box-shadow: 0 6px 24px rgb(0 0 0 / 0.08);
+  }
+}
+
+.banner {
+  grid-area: banner;
+  background: var(--banner);
+  color: var(--banner-text);
+  text-align: center;
+  font-size: 14px;
+  padding: 7px 12px;
+}
+
+.banner .link {
+  margin-left: 8px;
+  color: inherit;
+  text-decoration: underline;
+}
+
+/* ---- sidebar --------------------------------------------------------------------------------- */
+
+.sidebar {
+  grid-area: sidebar;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-height: 0;
+  min-width: 0;
+}
+
+.sidebar-header,
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  min-height: 58px;
+}
+
+.me {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.avatar {
+  flex: none;
+  border-radius: 50%;
+  display: inline-grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 600;
+  user-select: none;
+}
+
+.new-chat {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.new-chat input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.new-chat input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.new-chat button {
+  border: 0;
+  border-radius: 8px;
+  padding: 0 14px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.new-chat button:disabled {
+  opacity: 0.45;
+}
+
+.field-error {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 13px;
+  color: var(--danger);
+}
+
+.chat-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.chat-list-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 24px 16px;
+  margin: 0;
+}
+
+.chat-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  text-align: left;
+}
+
+.chat-item:hover {
+  background: var(--panel-2);
+}
+
+.chat-item.active {
+  background: var(--panel-2);
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.chat-item-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-item-top,
+.chat-item-bottom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-item-name {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-item-time {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.chat-item-time.unread {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chat-item-preview {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-item-preview .tick {
+  margin-right: 5px;
+}
+
+.badge {
+  flex: none;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+/* ---- chat pane ------------------------------------------------------------------------------- */
+
+.pane {
+  grid-area: pane;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--chat-bg);
+}
+
+.pane-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  padding: 24px;
+  text-align: center;
+}
+
+.pane-header {
+  border-bottom: 1px solid var(--border);
+}
+
+.pane-header h2 {
+  margin: 0;
+  font-size: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.back {
+  display: none;
+  border: 0;
+  background: none;
+  font-size: 28px;
+  line-height: 1;
+  padding: 0 6px 4px 0;
+  color: var(--accent);
+}
+
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 6% 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  /* MessageList restores the position itself when older messages are prepended. Browser scroll
+     anchoring (Chrome, Firefox; not Safari) would apply the same correction a second time. */
+  overflow-anchor: none;
+}
+
+.messages-empty {
+  margin: auto;
+  color: var(--muted);
+  background: var(--panel);
+  padding: 8px 14px;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  font-size: 14px;
+}
+
+/* Overlaid rather than in the flow, so showing it doesn't shift the messages under the reader. */
+.loading-older {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px 12px;
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+
+.day {
+  display: flex;
+  justify-content: center;
+  margin: 10px 0 6px;
+}
+
+.day span {
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+}
+
+.row.mine {
+  align-items: flex-end;
+}
+
+.row.theirs {
+  align-items: flex-start;
+}
+
+.bubble {
+  position: relative;
+  max-width: min(75%, 560px);
+  padding: 6px 9px 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  --meta-width: 44px;
+}
+
+.mine .bubble {
+  background: var(--mine);
+  border-top-right-radius: 3px;
+  --meta-width: 66px;
+}
+
+.theirs .bubble {
+  background: var(--theirs);
+  border-top-left-radius: 3px;
+}
+
+.bubble.failed {
+  opacity: 0.75;
+}
+
+.bubble .text {
+  margin: 0;
+  /* Newlines from Shift+Enter are kept; a long unbroken word or URL wraps instead of widening
+     the bubble past the pane. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The time and ticks sit in the bottom-right corner. This spacer reserves that room at the end
+   of the last line, so text wraps before it instead of running underneath. */
+.bubble .text::after {
+  content: '';
+  display: inline-block;
+  width: var(--meta-width);
+}
+
+.bubble .meta {
+  position: absolute;
+  right: 8px;
+  bottom: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.tick {
+  font-size: 12px;
+  letter-spacing: -3px;
+  padding-right: 3px;
+}
+
+.tick-pending {
+  letter-spacing: 0;
+  padding-right: 0;
+  font-size: 10px;
+}
+
+.tick-read {
+  color: var(--read);
+}
+
+.tick-failed {
+  color: #fff;
+  background: var(--danger);
+  border-radius: 50%;
+  width: 14px;
+  height: 14px;
+  display: inline-grid;
+  place-items: center;
+  letter-spacing: 0;
+  padding: 0;
+  font-weight: 700;
+  font-size: 10px;
+}
+
+.bubble-error {
+  margin: 3px 2px 4px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.jump {
+  position: absolute;
+  bottom: 14px;
+  right: 18px;
+  border: 0;
+  border-radius: 16px;
+  padding: 6px 14px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.2);
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  border: 0;
+  border-radius: 20px;
+  padding: 10px 16px;
+  background: var(--panel);
+  line-height: 20px;
+  max-height: 160px;
+}
+
+.composer textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+}
+
+.counter {
+  align-self: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.counter.over {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.send {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 17px;
+}
+
+.send:disabled {
+  opacity: 0.45;
+}
+
+/* ---- narrow screens: one column at a time ----------------------------------------------------- */
+
+@media (max-width: 640px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      'banner'
+      'main';
+  }
+
+  .sidebar,
+  .pane {
+    grid-area: main;
+  }
+
+  .layout.has-open .sidebar,
+  .layout:not(.has-open) .pane {
+    display: none;
+  }
+
+  .sidebar {
+    border-right: 0;
+  }
+
+  .back {
+    display: block;
+  }
+
+  .messages {
+    padding: 10px 10px 14px;
+  }
+
+  .bubble {
+    max-width: 85%;
+  }
+}

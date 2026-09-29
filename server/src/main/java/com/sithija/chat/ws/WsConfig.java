@@ -1,5 +1,6 @@
 package com.sithija.chat.ws;
 
+import com.sithija.chat.ClientIpResolver;
 import com.sithija.chat.auth.AuthProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -16,9 +17,9 @@ public class WsConfig {
 
     @Bean(initMethod = "start", destroyMethod = "stop")
     public WsServer wsServer(WsProperties properties, MessageStore store, SessionAuthenticator sessions,
-                             AuthProperties auth) {
+                             AuthProperties auth, ClientIpResolver clientIps) {
         // The clock is injected so tests can move time forward instead of sleeping. The Origin
         // allowlist is the same one the REST CSRF check uses, so the two can't drift apart.
-        return new WsServer(properties, System::nanoTime, store, sessions, auth.allowedOrigins());
+        return new WsServer(properties, System::nanoTime, store, sessions, auth.allowedOrigins(), clientIps);
     }
 }

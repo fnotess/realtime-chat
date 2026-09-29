@@ -1,0 +1,16 @@
+# Local development: publishes Postgres to this machine only, for a server run with ./mvnw.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
+#
+# A separate file you name explicitly, not docker-compose.override.yml: compose loads an override
+# file automatically, so the plain `docker compose up --build` would publish the database as well.
+# Not a profile either: profiles switch whole services on and off, not a service's ports, so it
+# would take a second Postgres service on the same volume, and two of those running at once would
+# corrupt it.
+#
+# 127.0.0.1 only: the default binds every interface, which puts the database (with a default
+# password) on the LAN.
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"

@@ -38,7 +38,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * real WsServer on a free port. Every test uses fresh usernames and its own client IP, because
  * the context (and so the rate limiters) is shared by all tests.
  */
-@SpringBootTest(properties = {"chat.ws.port=0", "chat.auth.bcrypt-cost=4"})
+// 10.255.0.1 plays the reverse proxy. The per-test client IPs are 10.0.x.x, so they stay untrusted.
+@SpringBootTest(properties = {"chat.ws.port=0", "chat.auth.bcrypt-cost=4", "chat.auth.trusted-proxies=10.255.0.1"})
 @AutoConfigureMockMvc
 @Import(TestcontainersConfig.class)
 class AuthTest {
@@ -160,6 +161,28 @@ class AuthTest {
     }
 
     @Test
+    void loginIpLimitUsesForwardedClientOnlyBehindTrustedProxy() throws Exception {
+        String proxy = "10.255.0.1";
+        String sprayer = "203.0.113." + (int) (Math.random() * 250);
+        for (int i = 0; i < 50; i++) {
+            assertEquals(401, sendVia(proxy, sprayer, fresh("spray"), "password1").getStatus());
+        }
+        String name = fresh("lena");
+        send(post("/api/auth/register"), name, "password1");
+        // The sprayer is blocked, but another user behind the same proxy is not: the limit follows
+        // the forwarded client, not nginx's address.
+        assertEquals(429, sendVia(proxy, sprayer, name, "password1").getStatus());
+        assertEquals(200, sendVia(proxy, "198.51.100.1", name, "password1").getStatus());
+        // Direct from an untrusted peer, the header is ignored: the sprayer can't claim a fresh IP...
+        for (int i = 0; i < 50; i++) {
+            sendVia(ip, "198.51.100." + i, fresh("spray"), "password1");
+        }
+        assertEquals(429, sendVia(ip, "198.51.100.200", name, "password1").getStatus());
+        // ...and the header didn't charge the forged addresses either.
+        assertEquals(200, sendVia(proxy, "198.51.100.2", name, "password1").getStatus());
+    }
+
+    @Test
     void stateChangingRequestsNeedAnAllowedOrigin() throws Exception {
         Cookie cookie = register(fresh("gina"));
         String body = "{\"username\":\"" + fresh("h") + "\",\"password\":\"password1\"}";
@@ -232,6 +255,11 @@ class AuthTest {
 
     private MockHttpServletResponse send(MockHttpServletRequestBuilder req, String username, String password) throws Exception {
         return sendFrom(ip, req, username, password);
+    }
+
+    private MockHttpServletResponse sendVia(String peer, String forwardedFor, String username, String password)
+            throws Exception {
+        return sendFrom(peer, post("/api/auth/login").header("X-Forwarded-For", forwardedFor), username, password);
     }
 
     private MockHttpServletResponse sendFrom(String clientIp, MockHttpServletRequestBuilder req, String username,

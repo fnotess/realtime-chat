@@ -144,7 +144,7 @@ sequenceDiagram
     Note over B: buffer live messages from here on
     B->>S: GET /api/conversations/{id}/messages?afterSeq=N (pages of 100)
     S-->>B: missed messages
-    Note over B: merge by id, apply the buffer, resend outbox with the same clientMsgIds
+    Note over S,B: bob merges by id and applies the buffer,<br/>then resends bob's outbox with the same clientMsgIds
 ```
 
 The order on the server is always **persist → commit → ack → fan-out**. The ack means "durably

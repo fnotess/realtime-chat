@@ -1,5 +1,6 @@
 package com.sithija.chat.ws;
 
+import com.sithija.chat.ClientIpResolver;
 import com.sithija.chat.ws.SessionAuthenticator.AuthenticatedSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -88,6 +89,7 @@ public class WsServer {
     private final ConcurrentHashMap<String, Integer> connectionsPerUser = new ConcurrentHashMap<>();
     private final SessionAuthenticator sessions;
     private final Set<String> allowedOrigins;
+    private final ClientIpResolver clientIps;
 
     private ServerSocket serverSocket;
     private Thread sweeper;
@@ -95,11 +97,12 @@ public class WsServer {
     private volatile boolean running;
 
     public WsServer(WsProperties props, LongSupplier clock, MessageStore store, SessionAuthenticator sessions,
-                    List<String> allowedOrigins) {
+                    List<String> allowedOrigins, ClientIpResolver clientIps) {
         this.props = props;
         this.clock = clock;
         this.sessions = sessions;
         this.allowedOrigins = Set.copyOf(allowedOrigins);
+        this.clientIps = clientIps;
         this.router = new MessageRouter(registry, store);
     }
 
@@ -285,11 +288,19 @@ public class WsServer {
     }
 
     private void handleConnection(Socket socket) {
-        InetAddress ip = socket.getInetAddress();
-        // Decided at accept time, so half-finished handshakes count too, which also caps how
-        // many slowloris sockets one IP can hold. The 429 is only sent once the request has
-        // been read, so it's a proper HTTP response (see performHandshake).
-        boolean admitted = tryAdmit(connectionsPerIp, ip, props.maxConnectionsPerIp());
+        InetAddress peer = socket.getInetAddress();
+        // Behind a trusted proxy the peer is the proxy for every user, so the per-IP slot has to
+        // wait for X-Forwarded-For in the request headers. Anyone else is counted by the peer
+        // address right away, and any forwarding headers they send are ignored (spoofing them
+        // would otherwise dodge the limit).
+        boolean proxied = clientIps.isTrustedProxy(peer);
+        InetAddress ip = peer;
+        // Direct peers are admitted at accept time, so half-finished handshakes count too, which
+        // caps how many slowloris sockets one IP can hold. Proxied ones don't need that: nginx
+        // only forwards once it has the complete request headers, so a slow client ties up nginx,
+        // not us. The 429 is only sent once the request has been read, so it's a proper HTTP
+        // response (see performHandshake).
+        boolean admitted = !proxied && tryAdmit(connectionsPerIp, ip, props.maxConnectionsPerIp());
         // Non-null once the handshake has authenticated the user and taken a per-user slot.
         AuthenticatedSession session = null;
         // try-with-resources guarantees the socket is closed however this method exits,
@@ -304,12 +315,20 @@ public class WsServer {
             InputStream in = new BufferedInputStream(socket.getInputStream());
             OutputStream out = socket.getOutputStream();
 
-            session = performHandshake(in, out, admitted);
+            Map<String, String> headers = readRequest(in, out);
+            if (headers == null) {
+                return;
+            }
+            if (proxied) {
+                ip = clientIps.resolve(peer, headers.get("x-forwarded-for"));
+                admitted = tryAdmit(connectionsPerIp, ip, props.maxConnectionsPerIp());
+            }
+            session = performHandshake(headers, out, admitted);
             if (session == null) {
                 return;
             }
             String userId = session.username();
-            log.info("Handshake OK from {} as {}", socket.getRemoteSocketAddress(), userId);
+            log.info("Handshake OK from {} as {}", ip.getHostAddress(), userId);
 
             // After the handshake the connection is long-lived and idle most of the time,
             // so the read timeout must go. The heartbeat sweeper detects dead peers instead.
@@ -320,7 +339,9 @@ public class WsServer {
             // out in a single write.
             socket.setTcpNoDelay(true);
 
-            var addr = socket.getRemoteSocketAddress();
+            // The client's address for logs, not nginx's.
+            String addr = proxied ? ip.getHostAddress() + " via " + peer.getHostAddress()
+                    : String.valueOf(socket.getRemoteSocketAddress());
             // Wraps the SAME buffered stream the handshake used (see above), so frame bytes
             // that arrived together with the handshake aren't skipped.
             WsConnection conn = new WsConnection(socket, userId + "@" + addr, clock, props.sendQueueCapacity());
@@ -432,21 +453,24 @@ public class WsServer {
         }
     }
 
-    /** Returns the session if the upgrade succeeded; otherwise writes an HTTP error and returns null. */
-    private AuthenticatedSession performHandshake(InputStream in, OutputStream out, boolean admitted) throws IOException {
+    /** Reads the request line and headers. Returns null after writing a 400 if they're unusable. */
+    private Map<String, String> readRequest(InputStream in, OutputStream out) throws IOException {
         String requestLine = readLine(in);
         if (requestLine == null || !requestLine.startsWith("GET ")) {
             // RFC 6455 section 4.1: the opening handshake must be an HTTP GET.
             writeHttpError(out, "400 Bad Request");
             return null;
         }
-
         Map<String, String> headers = readHeaders(in);
         if (headers == null) {
             writeHttpError(out, "400 Bad Request");
-            return null;
         }
+        return headers;
+    }
 
+    /** Returns the session if the upgrade succeeded; otherwise writes an HTTP error and returns null. */
+    private AuthenticatedSession performHandshake(Map<String, String> headers, OutputStream out, boolean admitted)
+            throws IOException {
         boolean isUpgrade = "websocket".equalsIgnoreCase(headers.get("upgrade"));
         // contains(), not equals(): Firefox sends "Connection: keep-alive, Upgrade".
         boolean hasConnectionUpgrade =
@@ -570,7 +594,15 @@ public class WsServer {
             // Locale.ROOT, not the default locale: under e.g. a Turkish locale "CONNECTION"
             // lower-cases to "connectıon" (dotless i), so the lookup would miss and a valid
             // handshake would get a 400.
-            headers.put(line.substring(0, colon).trim().toLowerCase(Locale.ROOT), line.substring(colon + 1).trim());
+            String name = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
+            String value = line.substring(colon + 1).trim();
+            if (name.equals("x-forwarded-for")) {
+                // Repeated lines equal one comma-joined list (RFC 9110 §5.3). Keeping only the last
+                // could drop hops, and ClientIpResolver needs them all, in order.
+                headers.merge(name, value, (a, b) -> a + ", " + b);
+            } else {
+                headers.put(name, value);
+            }
         }
         return null; // too many headers
     }

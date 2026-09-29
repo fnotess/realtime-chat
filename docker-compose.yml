@@ -1,8 +1,91 @@
+# Full app:  docker compose up --build   →  http://localhost:3000
+# Dev DB only (for ./mvnw spring-boot:run + npm run dev):
+#            docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
+#
+# Only `web` publishes a port. db and server are reachable only on the internal network, through nginx.
+#
+# Credentials come from .env (gitignored; copy .env.example). The ${VAR:-chat} defaults exist so a
+# fresh clone starts with one command; they're only acceptable because the database is never
+# published in this file. Set real values in .env for anything beyond a local demo.
+
 services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: chat
-      POSTGRES_PASSWORD: chat
-      POSTGRES_DB: chat
-    ports: ["5432:5432"]
+      POSTGRES_USER: ${POSTGRES_USER:-chat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chat}
+      POSTGRES_DB: ${POSTGRES_DB:-chat}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h localhost: the TCP listener, not the Unix socket, which is up earlier during initdb's
+      # temporary server and would report ready before the real one starts.
+      test: ["CMD-SHELL", "pg_isready -h localhost -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # Probe every second while starting, so `server` doesn't sit out a whole 5s interval.
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    networks: [chat]
+
+  server:
+    build: ./server
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-chat}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-chat}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-chat}
+      # The browser's origin is nginx's, so that's what both the REST CSRF check and the WS
+      # handshake must allow. Both spellings, since localhost and 127.0.0.1 are different origins.
+      CHAT_AUTH_ALLOWEDORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      # Believe X-Forwarded-For only from nginx's fixed address (see `web` below).
+      CHAT_AUTH_TRUSTEDPROXIES: 172.28.5.10
+      # Plain http on localhost, so the cookie can't be Secure (the browser would drop it).
+      # Behind HTTPS in production this must be true.
+      CHAT_AUTH_COOKIESECURE: ${CHAT_AUTH_COOKIESECURE:-false}
+    healthcheck:
+      # busybox wget ships in the Alpine JRE image. /healthz is internal (nginx doesn't route it).
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      # JVM + Spring + Flyway take a few seconds; failures during this window don't count, and
+      # probing every second in it lets `web` start as soon as the server is up.
+      start_period: 60s
+      start_interval: 1s
+    # The JVM sizes its heap from this (MaxRAMPercentage=75 in the Dockerfile).
+    mem_limit: 768m
+    # docker stop sends SIGTERM, then SIGKILL after this. Spring drains REST for up to 10s, then
+    # WsServer sends 1001 to every socket and waits 2s for the close handshake. Docker's default of
+    # 10s could SIGKILL before the 1001 goes out.
+    stop_grace_period: 30s
+    restart: unless-stopped
+    networks: [chat]
+
+  web:
+    build: ./client
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    networks:
+      chat:
+        # Fixed so the server can trust exactly this address, rather than the whole network.
+        ipv4_address: 172.28.5.10
+
+networks:
+  chat:
+    ipam:
+      # Fixed so web's address is known. If it overlaps a network on your machine, change the
+      # subnet, web's ipv4_address and CHAT_AUTH_TRUSTEDPROXIES together.
+      config:
+        - subnet: 172.28.5.0/24
+
+volumes:
+  pgdata:

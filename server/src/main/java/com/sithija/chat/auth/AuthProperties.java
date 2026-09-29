@@ -24,5 +24,8 @@ public record AuthProperties(
         @DefaultValue("12") int bcryptCost,
         @DefaultValue("5") int loginMaxFailuresPerUser,
         @DefaultValue("50") int loginMaxFailuresPerIp,
-        @DefaultValue("15m") Duration loginWindow) {
+        @DefaultValue("15m") Duration loginWindow,
+        // Reverse proxies whose X-Forwarded-For is believed (IPs or CIDRs). Empty by default: with
+        // no proxy in front, the header is client-controlled and must be ignored. See ClientIpResolver.
+        @DefaultValue("") List<String> trustedProxies) {
 }

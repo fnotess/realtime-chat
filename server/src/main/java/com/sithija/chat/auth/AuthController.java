@@ -42,10 +42,10 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    ResponseEntity<Me> login(@RequestBody Credentials c, HttpServletRequest request) {
-        // The direct peer's address. Behind a reverse proxy this is the proxy for every client,
-        // so production would read X-Forwarded-For as set by that trusted proxy.
-        NewSession s = auth.login(c.username(), c.password(), request.getRemoteAddr());
+    ResponseEntity<Me> login(@RequestBody Credentials c, @RequestAttribute(AuthFilter.CLIENT_IP) String clientIp) {
+        // The real client IP, not getRemoteAddr(): behind nginx that would be the proxy for
+        // every user, and one user's failures would lock out everyone. See ClientIpResolver.
+        NewSession s = auth.login(c.username(), c.password(), clientIp);
         return withSession(ResponseEntity.ok(), s);
     }
 

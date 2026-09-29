@@ -1,5 +1,6 @@
 package com.sithija.chat.ws;
 
+import com.sithija.chat.ClientIpResolver;
 import org.junit.jupiter.api.AfterEach;
 import com.sithija.chat.ws.SessionAuthenticator.AuthenticatedSession;
 import org.junit.jupiter.api.Test;
@@ -51,6 +52,8 @@ class WsServerTest {
     private final InMemoryMessageStore store = new InMemoryMessageStore();
     private final FakeSessions sessions = new FakeSessions();
     private WsServer server;
+    // Set before start() to put the test client "behind" a proxy.
+    private List<String> trustedProxies = List.of();
 
     @AfterEach
     void tearDown() throws Exception {
@@ -159,6 +162,30 @@ class WsServerTest {
                 return false;
             }
         });
+    }
+
+    @Test
+    void perIpLimitBehindTrustedProxyCountsEachForwardedClient() throws Exception {
+        // The test's own socket plays nginx. Both loopback forms, since "localhost" may be ::1.
+        trustedProxies = List.of("127.0.0.1", "::1");
+        start(2);
+        assertEquals("HTTP/1.1 101 Switching Protocols", handshakeVia("203.0.113.1").statusLine);
+        assertEquals("HTTP/1.1 101 Switching Protocols", handshakeVia("203.0.113.1").statusLine);
+        assertEquals("HTTP/1.1 429 Too Many Requests", handshakeVia("203.0.113.1").statusLine);
+        // Same proxy, different client: its own bucket. Without the header every user would share
+        // nginx's one bucket, and 100 users would lock out the 101st.
+        assertEquals("HTTP/1.1 101 Switching Protocols", handshakeVia("203.0.113.2").statusLine);
+        // A spoofed entry to the left of what the proxy appended changes nothing.
+        assertEquals("HTTP/1.1 429 Too Many Requests", handshakeVia("9.9.9.9, 203.0.113.1").statusLine);
+    }
+
+    @Test
+    void forwardedForFromUntrustedPeerIsIgnored() throws Exception {
+        // No trusted proxies: a client can't get a fresh bucket by making up X-Forwarded-For.
+        start(2);
+        assertEquals("HTTP/1.1 101 Switching Protocols", handshakeVia("203.0.113.1").statusLine);
+        assertEquals("HTTP/1.1 101 Switching Protocols", handshakeVia("203.0.113.2").statusLine);
+        assertEquals("HTTP/1.1 429 Too Many Requests", handshakeVia("203.0.113.3").statusLine);
     }
 
     @Test
@@ -435,7 +462,7 @@ class WsServerTest {
         // fires during a test; the tests call sweep() themselves.
         WsProperties props = new WsProperties(0, PING_AFTER_IDLE, PONG_TIMEOUT, Duration.ofSeconds(10),
                 Duration.ofHours(1), Duration.ofMillis(300), maxPerUser, maxPerIp, 256);
-        server = new WsServer(props, now::get, store, sessions, List.of(ORIGIN));
+        server = new WsServer(props, now::get, store, sessions, List.of(ORIGIN), new ClientIpResolver(trustedProxies));
         server.start();
     }
 
@@ -473,8 +500,18 @@ class WsServerTest {
         return handshake("chat_session=" + sessions.login(user, Duration.ofDays(1)).token, ORIGIN);
     }
 
+    /** A handshake as a fresh user (so the per-user limit never interferes), as if forwarded by a proxy. */
+    private Client handshakeVia(String forwardedFor) throws IOException {
+        String cookie = "chat_session=" + sessions.login("u" + System.nanoTime(), Duration.ofDays(1)).token;
+        return handshake(cookie, ORIGIN, "X-Forwarded-For: " + forwardedFor + "\r\n");
+    }
+
     /** A browser-like upgrade request. null leaves the header out. */
     private Client handshake(String cookieHeader, String origin) throws IOException {
+        return handshake(cookieHeader, origin, "");
+    }
+
+    private Client handshake(String cookieHeader, String origin, String extraHeaders) throws IOException {
         Socket s = new Socket("localhost", server.localPort());
         clients.add(s);
         s.setSoTimeout(2000); // a missing frame fails the test instead of hanging it
@@ -483,6 +520,7 @@ class WsServerTest {
                 + "Sec-WebSocket-Version: 13\r\n"
                 + (origin == null ? "" : "Origin: " + origin + "\r\n")
                 + (cookieHeader == null ? "" : "Cookie: " + cookieHeader + "\r\n")
+                + extraHeaders
                 + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
         return new Client(s);
     }

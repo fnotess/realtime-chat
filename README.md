@@ -14,7 +14,6 @@ scratch rather than taken from a ready-made library, as the brief asked, and I t
 against the awkward timing problems that make chat apps lose or repeat messages.
 
 ![Two browser windows side by side: alice and bob chatting, with read ticks](docs/screenshot.png)
-<!-- TODO: add docs/screenshot.png (a normal and a private window, side by side) -->
 
 ## Quick start
 

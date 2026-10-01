@@ -89,6 +89,67 @@ truth for messages, sequence numbers, receipts and sessions; the only in-memory 
 who is connected where, which is why the app runs as a single node (see
 [Path to production](#path-to-production)).
 
+### Data model
+
+Generated from the Flyway migrations (V1–V3, applied in order).
+
+```mermaid
+erDiagram
+    users {
+        bigint id PK
+        text username UK "CHECK lowercase ^[a-z0-9_]{3,32}$"
+        timestamptz created_at
+        text password_hash
+    }
+    conversations {
+        bigint id PK
+        bigint user_a_id FK,UK "UK with user_b_id; CHECK user_a_id < user_b_id"
+        bigint user_b_id FK,UK "UK with user_a_id"
+        timestamptz created_at
+        bigint last_seq "per-conversation counter, default 0"
+    }
+    messages {
+        bigint id PK
+        bigint conversation_id FK,UK "UK with seq"
+        bigint seq UK "UK with conversation_id"
+        bigint sender_id FK,UK "UK with client_msg_id"
+        uuid client_msg_id UK "UK with sender_id"
+        text body
+        timestamptz created_at
+    }
+    sessions {
+        bigint id PK
+        bigint user_id FK "ON DELETE CASCADE"
+        bytea token_hash UK "SHA-256 of the token"
+        timestamptz created_at
+        timestamptz expires_at
+        timestamptz last_seen_at
+    }
+    conversation_receipts {
+        bigint conversation_id PK,FK "PK with user_id"
+        bigint user_id PK,FK "PK with conversation_id"
+        bigint last_delivered_seq "default 0"
+        bigint last_read_seq "CHECK last_read_seq <= last_delivered_seq"
+    }
+
+    users ||--o{ conversations : "is user_a"
+    users ||--o{ conversations : "is user_b"
+    conversations ||--o{ messages : contains
+    users ||--o{ messages : sends
+    users ||--o{ sessions : "logs in with"
+    conversations ||--o{ conversation_receipts : "has watermarks"
+    users ||--o{ conversation_receipts : "holds watermark"
+```
+
+Why the key constraints exist (details in [Key decisions](#key-decisions-and-trade-offs)):
+
+- `UNIQUE (conversation_id, seq)`: backs the gapless per-conversation ordering from the per-conversation seq decision.
+- `UNIQUE (sender_id, client_msg_id)`: makes retries idempotent, as in the idempotent `clientMsgId` decision.
+- `CHECK (user_a_id < user_b_id)` plus `UNIQUE (user_a_id, user_b_id)`: exactly one conversation per pair, which makes `INSERT … ON CONFLICT DO NOTHING` safe when both sides start a chat at once.
+- `CHECK (last_read_seq <= last_delivered_seq)`: read implies delivered, per the watermark receipts decision.
+- `sessions.token_hash`: only the SHA-256 of the token is stored, per the server-side sessions decision.
+- `users_username_format` CHECK: lowercase only, so `Alice` and `alice` can never be two accounts, even for rows not written by the app.
+
 ## What's hand-built and what uses libraries
 
 The brief's rule: the core real-time messaging must be built by hand; libraries are fine elsewhere.
@@ -439,13 +500,7 @@ separate cookies. All server settings are `chat.ws.*` and `chat.auth.*` in
 
 ## How AI was used
 
-I built this with Claude Code as a pair programmer. I directed the architecture, the protocol design
-and the trade-offs (for example subscribe-then-fetch with a `ready` frame, watermark receipts, and
-sessions over JWT), and I set the working rules in [CLAUDE.md](CLAUDE.md): small reviewable changes,
-comments that explain why, no dependency without a reason, and breaking the code on purpose to prove
-each safety test can fail. Claude wrote much of the code and tests to those decisions; I reviewed
-every change, ran the manual checks, and merged each phase as its own PR. I can explain and modify
-any part of it.
+I used Claude Code as a pair programmer. The architecture, protocol design and trade-offs are mine; I reviewed every change, ran the manual tests, and can explain and modify any part of the code.
 
 ## Guided tour
 
